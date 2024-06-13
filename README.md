@@ -85,8 +85,8 @@ Portable OpenSSH development is discussed on the [openssh-unix-dev mailing list]
 
 _Non-security_ bugs may be reported to the developers via [Bugzilla](https://bugzilla.mindrot.org/) or via the mailing list above. Security bugs should be reported to [openssh@openssh.com](mailto:openssh.openssh.com).
 
-#to install
-autoreconf
+to install
+`autoreconf`
 ./configure
 make
 sudo install/setup_privsep.sh
