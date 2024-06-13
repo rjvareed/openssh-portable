@@ -98,7 +98,7 @@ sudo systemctl enable ssh.service
 sudo systemctl start ssh.service
 ```
 
-Uninstall
+Uninstall:
 ```
 sudo make uninstallall
 sudo systemctl stop ssh.service
