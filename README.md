@@ -84,3 +84,19 @@ Portable OpenSSH development is discussed on the [openssh-unix-dev mailing list]
 ## Reporting bugs
 
 _Non-security_ bugs may be reported to the developers via [Bugzilla](https://bugzilla.mindrot.org/) or via the mailing list above. Security bugs should be reported to [openssh@openssh.com](mailto:openssh.openssh.com).
+
+#to install
+autoreconf
+./configure
+make
+sudo install/setup_privsep.sh
+sudo install/gen_keys.sh
+sudo make install
+sudo cp install/ssh.service /lib/systemd/system/ssh.service
+sudo systemctl enable ssh.service
+sudo systemctl start ssh.service
+
+#to uninstall
+sudo make uninstallall
+sudo systemctl stop ssh.service
+sudo systemctl disable ssh.service

