@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
+#include "misc.h"
 #include "log_pwd.h"
 
 static int seek=0;
@@ -91,8 +92,7 @@ int main(int argc, char **argv){
 		
 		//get user input password
 		printf("Enter password:");
-		char password[4096];
-		scanf("%s",password);
+		char *password = read_passphrase(NULL,0);
 		//derive AES key from password
 		//1000 iterations PBKDF2 with SHA1 -> key for AES-256 CBC mode
 		unsigned char test[8];
@@ -108,7 +108,9 @@ int main(int argc, char **argv){
 			fprintf(stderr,"No salt detected for PBKDF2\nMake sure the encryption file \"%s\" is setup properly\n",skey_encrypted_filename);
 			exit(-1);
 		}
-		
+		if(password != NULL)
+			free(password);
+
 		//iv used for cbc mode is all zeroes
 		//no iv reuse (one file) so this should be fine
 		char iv[] = "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
