@@ -1,4 +1,4 @@
-/* $OpenBSD: session.c,v 1.338 2024/05/17 00:30:24 djm Exp $ */
+/* $OpenBSD: session.c,v 1.340 2024/12/06 06:55:28 dtucker Exp $ */
 /*
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
  *                    All rights reserved
@@ -101,6 +101,17 @@
 
 #ifdef WITH_SELINUX
 #include <selinux/selinux.h>
+#endif
+
+/*
+ * Hack for systems that do not support FD passing: allocate PTYs directly
+ * without calling into the monitor. This requires either the post-auth
+ * privsep process retain root privileges (see the comment in
+ * sshd-session.c:privsep_postauth) or that PTY allocation doesn't require
+ * privileges to begin with (e.g. Cygwin).
+ */
+#ifdef DISABLE_FD_PASSING
+#define mm_pty_allocate pty_allocate
 #endif
 
 #define IS_INTERNAL_SFTP(c) \
@@ -1422,7 +1433,7 @@ do_pwchange(Session *s)
 	fprintf(stderr, "WARNING: Your password has expired.\n");
 	if (s->ttyfd != -1) {
 		fprintf(stderr,
-		    "You must change your password now and login again!\n");
+		    "You must change your password now and log in again!\n");
 #ifdef WITH_SELINUX
 		setexeccon(NULL);
 #endif
@@ -1499,8 +1510,7 @@ do_child(struct ssh *ssh, Session *s, const char *command)
 
 	sshpkt_fmt_connection_id(ssh, remote_id, sizeof(remote_id));
 
-	/* remove hostkey from the child's memory */
-	destroy_sensitive_data();
+	/* remove keys from memory */
 	ssh_packet_clear_keys(ssh);
 
 	/* Force a password change */
@@ -2132,10 +2142,6 @@ session_signal_req(struct ssh *ssh, Session *s)
 	if (s->forced || s->is_subsystem) {
 		error_f("refusing to send signal %s to %s session",
 		    signame, s->forced ? "forced-command" : "subsystem");
-		goto out;
-	}
-	if (mm_is_monitor()) {
-		error_f("session signalling requires privilege separation");
 		goto out;
 	}
 

@@ -3,8 +3,8 @@
 #include <unistd.h>
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
-#include "misc.h"
 #include "log_pwd.h"
+#include "misc.h"
 
 static int seek=0;
 static int count=-1;
@@ -17,7 +17,6 @@ static char *logfile = ""ENCRYPTED_OUTPUT_FILENAME;
 static char usagestring[] = "Usage: %s <-s seek_distance_records> <-c num_records_to_read> <-l last_n_records_to_read> <-logfile rsa_encrypted_log_file> <-aespemfile aes_encrypted_rsa4096_pem_file> <-pemfile rsa4096_pem_file>\n";
 
 int main(int argc, char **argv){
-	
 	//parse arguments
 	if(argc == 2 && (strcmp(argv[1],"--help") == 0 || strcmp(argv[1],"-h") == 0 || strcmp(argv[1],"-H") == 0)){
 		printf(usagestring,argv[0]);
@@ -91,8 +90,12 @@ int main(int argc, char **argv){
 		char ciphertext[4096];
 		
 		//get user input password
-		printf("Enter password:");
-		char *password = read_passphrase(NULL,0);
+		char prompt[] = "Enter password: ";
+		char *password = read_passphrase(prompt,RP_ALLOW_STDIN);
+		if(password == NULL){
+			fprintf(stderr,"read_passphrase failed\n");
+			exit(-1);
+		}
 		//derive AES key from password
 		//1000 iterations PBKDF2 with SHA1 -> key for AES-256 CBC mode
 		unsigned char test[8];

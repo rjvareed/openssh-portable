@@ -1,4 +1,4 @@
-/* $OpenBSD: sshd.c,v 1.607 2024/06/06 19:50:01 djm Exp $ */
+/* $OpenBSD: sshd.c,v 1.614 2024/12/07 10:12:19 djm Exp $ */
 /*
  * Copyright (c) 2000, 2001, 2002 Markus Friedl.  All rights reserved.
  * Copyright (c) 2002 Niels Provos.  All rights reserved.
@@ -262,7 +262,7 @@ child_register(int pipefd, int sockfd)
 	} else {
 		laddr = get_local_ipaddr(sockfd);
 		raddr = get_peer_ipaddr(sockfd);
-		xasprintf(&child->id, "connection from %s to %s", laddr, raddr);
+		xasprintf(&child->id, "connection from %s to %s", raddr, laddr);
 	}
 	free(laddr);
 	free(raddr);
@@ -381,6 +381,13 @@ child_reap(struct early_child *child)
 			    (long)child->pid, child->id,
 			    child->early ? " (early)" : "");
 			break;
+		case EXIT_CONFIG_REFUSED:
+			penalty_type = SRCLIMIT_PENALTY_REFUSECONNECTION;
+			debug_f("preauth child %ld for %s prohibited by"
+			    "RefuseConnection %s",
+			    (long)child->pid, child->id,
+			    child->early ? " (early)" : "");
+			break;
 		default:
 			penalty_type = SRCLIMIT_PENALTY_NOAUTH;
 			debug_f("preauth child %ld for %s exited "
@@ -390,25 +397,7 @@ child_reap(struct early_child *child)
 			break;
 		}
 	}
-	/*
-	 * XXX would be nice to have more subtlety here.
-	 *  - Different penalties
-	 *      a) authentication failures without success (e.g. brute force)
-	 *      b) login grace exceeded (penalise DoS)
-	 *      c) monitor crash (penalise exploit attempt)
-	 *      d) unpriv preauth crash (penalise exploit attempt)
-	 *  - Unpriv auth exit status/WIFSIGNALLED is not available because
-	 *    the "mm_request_receive: monitor fd closed" fatal kills the
-	 *    monitor before waitpid() can occur. It would be good to use the
-	 *    unpriv exit status to detect crashes.
-	 *
-	 * For now, just penalise (a), (b) and (c), since that is what we have
-	 * readily available. The authentication failures detection cannot
-	 * discern between failed authentication and other connection problems
-	 * until we have the unpriv exist status plumbed through (and the unpriv
-	 * child modified to use a different exit status when auth has been
-	 * attempted), but it's a start.
-	 */
+
 	if (child->have_addr)
 		srclimit_penalise(&child->addr, penalty_type);
 
@@ -423,9 +412,25 @@ static void
 child_reap_all_exited(void)
 {
 	int i;
+	pid_t pid;
+	int status;
 
 	if (children == NULL)
 		return;
+
+	for (;;) {
+		if ((pid = waitpid(-1, &status, WNOHANG)) == 0)
+			break;
+		else if (pid == -1) {
+			if (errno == EINTR || errno == EAGAIN)
+				continue;
+			if (errno != ECHILD)
+				error_f("waitpid: %s", strerror(errno));
+			break;
+		}
+		child_exit(pid, status);
+	}
+
 	for (i = 0; i < options.max_startups; i++) {
 		if (!children[i].have_status)
 			continue;
@@ -515,29 +520,10 @@ siginfo_handler(int sig)
 }
 #endif
 
-/*
- * SIGCHLD handler.  This is called whenever a child dies.  This will then
- * reap any zombies left by exited children.
- */
 static void
 main_sigchld_handler(int sig)
 {
-	int save_errno = errno;
-	pid_t pid;
-	int status;
-
-	for (;;) {
-		if ((pid = waitpid(-1, &status, WNOHANG)) == 0)
-			break;
-		else if (pid == -1) {
-			if (errno == EINTR)
-				continue;
-			break;
-		}
-		child_exit(pid, status);
-		received_sigchld = 1;
-	}
-	errno = save_errno;
+	received_sigchld = 1;
 }
 
 /*
@@ -578,59 +564,51 @@ should_drop_connection(int startups)
 static int
 drop_connection(int sock, int startups, int notify_pipe)
 {
+	static struct log_ratelimit_ctx ratelimit_maxstartups;
+	static struct log_ratelimit_ctx ratelimit_penalty;
+	static int init_done;
 	char *laddr, *raddr;
-	const char *reason = NULL, msg[] = "Not allowed at this time\r\n";
-	static time_t last_drop, first_drop;
-	static u_int ndropped;
-	LogLevel drop_level = SYSLOG_LEVEL_VERBOSE;
-	time_t now;
+	const char *reason = NULL, *subreason = NULL;
+	const char msg[] = "Not allowed at this time\r\n";
+	struct log_ratelimit_ctx *rl = NULL;
+	int ratelimited;
+	u_int ndropped;
 
-	if (!srclimit_penalty_check_allow(sock, &reason)) {
-		drop_level = SYSLOG_LEVEL_INFO;
-		goto handle;
+	if (!init_done) {
+		init_done = 1;
+		log_ratelimit_init(&ratelimit_maxstartups, 4, 60, 20, 5*60);
+		log_ratelimit_init(&ratelimit_penalty, 8, 60, 30, 2*60);
 	}
 
-	now = monotime();
-	if (!should_drop_connection(startups) &&
-	    srclimit_check_allow(sock, notify_pipe) == 1) {
-		if (last_drop != 0 &&
-		    startups < options.max_startups_begin - 1) {
-			/* XXX maybe need better hysteresis here */
-			logit("exited MaxStartups throttling after %s, "
-			    "%u connections dropped",
-			    fmt_timeframe(now - first_drop), ndropped);
-			last_drop = 0;
-		}
-		return 0;
+	/* PerSourcePenalties */
+	if (!srclimit_penalty_check_allow(sock, &subreason)) {
+		reason = "PerSourcePenalties";
+		rl = &ratelimit_penalty;
+	} else {
+		/* MaxStartups */
+		if (!should_drop_connection(startups) &&
+		    srclimit_check_allow(sock, notify_pipe) == 1)
+			return 0;
+		reason = "Maxstartups";
+		rl = &ratelimit_maxstartups;
 	}
 
-#define SSHD_MAXSTARTUPS_LOG_INTERVAL	(5 * 60)
-	if (last_drop == 0) {
-		error("beginning MaxStartups throttling");
-		drop_level = SYSLOG_LEVEL_INFO;
-		first_drop = now;
-		ndropped = 0;
-	} else if (last_drop + SSHD_MAXSTARTUPS_LOG_INTERVAL < now) {
-		/* Periodic logs */
-		error("in MaxStartups throttling for %s, "
-		    "%u connections dropped",
-		    fmt_timeframe(now - first_drop), ndropped + 1);
-		drop_level = SYSLOG_LEVEL_INFO;
-	}
-	last_drop = now;
-	ndropped++;
-	reason = "past Maxstartups";
-
- handle:
 	laddr = get_local_ipaddr(sock);
 	raddr = get_peer_ipaddr(sock);
-	do_log2(drop_level, "drop connection #%d from [%s]:%d on [%s]:%d %s",
+	ratelimited = log_ratelimit(rl, time(NULL), NULL, &ndropped);
+	do_log2(ratelimited ? SYSLOG_LEVEL_DEBUG3 : SYSLOG_LEVEL_INFO,
+	    "drop connection #%d from [%s]:%d on [%s]:%d %s",
 	    startups,
 	    raddr, get_peer_port(sock),
 	    laddr, get_local_port(sock),
-	    reason);
+	    subreason != NULL ? subreason : reason);
 	free(laddr);
 	free(raddr);
+	if (ndropped != 0) {
+		logit("%s logging rate-limited: additional %u connections "
+		    "dropped", reason, ndropped);
+	}
+
 	/* best-effort notification to client */
 	(void)write(sock, msg, sizeof(msg) - 1);
 	return 1;
@@ -1362,7 +1340,7 @@ main(int ac, char **av)
 			break;
 		}
 	}
-	if (!test_flag && !do_dump_cfg && !path_absolute(av[0]))
+	if (!test_flag && !inetd_flag && !do_dump_cfg && !path_absolute(av[0]))
 		fatal("sshd requires execution with an absolute path");
 
 	closefrom(STDERR_FILENO + 1);
@@ -1677,6 +1655,13 @@ main(int ac, char **av)
 	if (stat(rexec_argv[0], &sb) != 0 || !(sb.st_mode & (S_IXOTH|S_IXUSR)))
 		fatal("%s does not exist or is not executable", rexec_argv[0]);
 	debug3("using %s for re-exec", rexec_argv[0]);
+
+	/* Ensure that the privsep binary exists now too. */
+	if (stat(options.sshd_auth_path, &sb) != 0 ||
+	    !(sb.st_mode & (S_IXOTH|S_IXUSR))) {
+		fatal("%s does not exist or is not executable",
+		    options.sshd_auth_path);
+	}
 
 	listener_proctitle = prepare_proctitle(ac, av);
 

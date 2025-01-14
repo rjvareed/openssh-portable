@@ -33,8 +33,8 @@
 .\" (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 .\" THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 .\"
-.\" $OpenBSD: sshd_config.5,v 1.359 2024/06/11 01:07:35 djm Exp $
-.Dd $Mdocdate: June 11 2024 $
+.\" $OpenBSD: sshd_config.5,v 1.380 2024/12/06 16:24:27 djm Exp $
+.Dd $Mdocdate: December 6 2024 $
 .Dt SSHD_CONFIG 5
 .Os
 .Sh NAME
@@ -250,7 +250,7 @@ If no arguments are specified then the username of the target user is used.
 .Pp
 The program should produce on standard output zero or
 more lines of authorized_keys output (see
-.Sx AUTHORIZED_KEYS
+.Cm AUTHORIZED_KEYS
 in
 .Xr sshd 8 ) .
 .Cm AuthorizedKeysCommand
@@ -279,7 +279,7 @@ The format is described in the AUTHORIZED_KEYS FILE FORMAT section of
 .Xr sshd 8 .
 Arguments to
 .Cm AuthorizedKeysFile
-accept the tokens described in the
+may include wildcards and accept the tokens described in the
 .Sx TOKENS
 section.
 After expansion,
@@ -339,7 +339,7 @@ When using certificates signed by a key listed in
 this file lists names, one of which must appear in the certificate for it
 to be accepted for authentication.
 Names are listed one per line preceded by key options (as described in
-.Sx AUTHORIZED_KEYS FILE FORMAT
+.Cm AUTHORIZED_KEYS FILE FORMAT
 in
 .Xr sshd 8 ) .
 Empty lines and comments starting with
@@ -348,7 +348,7 @@ are ignored.
 .Pp
 Arguments to
 .Cm AuthorizedPrincipalsFile
-accept the tokens described in the
+may include wildcards and accept the tokens described in the
 .Sx TOKENS
 section.
 After expansion,
@@ -576,8 +576,8 @@ chacha20-poly1305@openssh.com
 The default is:
 .Bd -literal -offset indent
 chacha20-poly1305@openssh.com,
-aes128-ctr,aes192-ctr,aes256-ctr,
-aes128-gcm@openssh.com,aes256-gcm@openssh.com
+aes128-gcm@openssh.com,aes256-gcm@openssh.com,
+aes128-ctr,aes192-ctr,aes256-ctr
 .Ed
 .Pp
 The list of available ciphers may also be obtained using
@@ -1003,9 +1003,13 @@ file on logout.
 The default is
 .Cm yes .
 .It Cm KexAlgorithms
-Specifies the available KEX (Key Exchange) algorithms.
+Specifies the permitted KEX (Key Exchange) algorithms that the server will
+offer to clients.
+The ordering of this list is not important, as the client specifies the
+preference order.
 Multiple algorithms must be comma-separated.
-Alternately if the specified list begins with a
+.Pp
+If the specified list begins with a
 .Sq +
 character, then the specified algorithms will be appended to the default set
 instead of replacing them.
@@ -1017,6 +1021,7 @@ If the specified list begins with a
 .Sq ^
 character, then the specified algorithms will be placed at the head of the
 default set.
+.Pp
 The supported algorithms are:
 .Pp
 .Bl -item -compact -offset indent
@@ -1045,20 +1050,22 @@ ecdh-sha2-nistp384
 .It
 ecdh-sha2-nistp521
 .It
+mlkem768x25519-sha256
+.It
+sntrup761x25519-sha512
+.It
 sntrup761x25519-sha512@openssh.com
 .El
 .Pp
 The default is:
 .Bd -literal -offset indent
-sntrup761x25519-sha512@openssh.com,
+mlkem768x25519-sha256,
+sntrup761x25519-sha512,sntrup761x25519-sha512@openssh.com,
 curve25519-sha256,curve25519-sha256@libssh.org,
-ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,
-diffie-hellman-group-exchange-sha256,
-diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,
-diffie-hellman-group14-sha256
+ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521
 .Ed
 .Pp
-The list of available key exchange algorithms may also be obtained using
+The list of supported key exchange algorithms may also be obtained using
 .Qq ssh -Q KexAlgorithms .
 .It Cm ListenAddress
 Specifies the local addresses
@@ -1128,8 +1135,8 @@ Logging with a DEBUG level violates the privacy of users and is not recommended.
 .It Cm LogVerbose
 Specify one or more overrides to
 .Cm LogLevel .
-An override consists of a pattern lists that matches the source file, function
-and line number to force detailed logging for.
+An override consists of one or more pattern lists that matches the
+source file, function and line number to force detailed logging for.
 For example, an override pattern of:
 .Bd -literal -offset indent
 kex.c:*:1000,*:kex_exchange_identification():*,packet.c:*
@@ -1227,9 +1234,11 @@ applied.
 .Pp
 The arguments to
 .Cm Match
-are one or more criteria-pattern pairs or the single token
-.Cm All
-which matches all criteria.
+are one or more criteria-pattern pairs or one of the single token criteria:
+.Cm All ,
+which matches all criteria, or
+.Cm Invalid-User ,
+which matches when the requested user-name does not match any known account.
 The available criteria are
 .Cm User ,
 .Cm Group ,
@@ -1302,6 +1311,7 @@ Available keywords are
 .Cm LogLevel ,
 .Cm MaxAuthTries ,
 .Cm MaxSessions ,
+.Cm PAMServiceName ,
 .Cm PasswordAuthentication ,
 .Cm PermitEmptyPasswords ,
 .Cm PermitListen ,
@@ -1313,6 +1323,7 @@ Available keywords are
 .Cm PubkeyAcceptedAlgorithms ,
 .Cm PubkeyAuthentication ,
 .Cm PubkeyAuthOptions ,
+.Cm RefuseConnection ,
 .Cm RekeyLimit ,
 .Cm RevokedKeys ,
 .Cm RDomain ,
@@ -1368,6 +1379,13 @@ and
 key exchange methods.
 The default is
 .Pa /etc/moduli .
+.It Cm PAMServiceName
+Specifies the service name used for Pluggable Authentication Modules (PAM)
+authentication, authorisation and session controls when
+.Cm UsePAM
+is enabled.
+The default is
+.Cm sshd .
 .It Cm PasswordAuthentication
 Specifies whether password authentication is allowed.
 The default is
@@ -1573,7 +1591,7 @@ accumulated.
 .Pp
 Penalties are enabled by default with the default settings listed below
 but may disabled using the
-.Cm off
+.Cm no
 keyword.
 The defaults may be overridden by specifying one or more of the keywords below,
 separated by whitespace.
@@ -1586,6 +1604,11 @@ Specifies how long to refuse clients that cause a crash of
 .It Cm authfail:duration
 Specifies how long to refuse clients that disconnect after making one or more
 unsuccessful authentication attempts (default: 5s).
+.It Cm refuseconnection:duration
+Specifies how long to refuse clients that were administratively prohibited
+connection via the
+.Cm RefuseConnection
+option (default: 10s).
 .It Cm noauth:duration
 Specifies how long to refuse clients that disconnect without attempting
 authentication (default: 1s).
@@ -1594,7 +1617,8 @@ scanning tools such as
 .Xr ssh-keyscan 1 .
 .It Cm grace-exceeded:duration
 Specifies how long to refuse clients that fail to authenticate after
-.Cm LoginGraceTime (default: 20s).
+.Cm LoginGraceTime
+(default: 10s).
 .It Cm max:duration
 Specifies the maximum time a particular source address range will be refused
 access for (default: 10m).
@@ -1602,12 +1626,14 @@ Repeated penalties will accumulate up to this maximum.
 .It Cm min:duration
 Specifies the minimum penalty that must accrue before enforcement begins
 (default: 15s).
-.It Cm max-sources:number
-Specifies the maximum number of penalise client address ranges to track
-(default: 65536).
+.It Cm max-sources4:number , max-sources6:number
+Specifies the maximum number of client IPv4 and IPv6 address ranges to
+track for penalties (default: 65536 for both).
 .It Cm overflow:mode
 Controls how the server behaves when
-.Cm max-sources
+.Cm max-sources4
+or
+.Cm max-sources6
 is exceeded.
 There are two operating modes:
 .Cm deny-all ,
@@ -1617,6 +1643,14 @@ until a penalty expires, and
 .Cm permissive ,
 which allows new connections by removing existing penalties early
 (default: permissive).
+Note that client penalties below the
+.Cm min
+threshold count against the total number of tracked penalties.
+IPv4 and IPv6 addresses are tracked separately, so an overflow in one will
+not affect the other.
+.It Cm overflow6:mode
+Allows specifying a different overflow mode for IPv6 addresses.
+The default it to use the same overflow mode as was specified for IPv4.
 .El
 .It Cm PerSourcePenaltyExemptList
 Specifies a comma-separated list of addresses to exempt from penalties.
@@ -1732,6 +1766,18 @@ options have any effect for other, non-FIDO, public key types.
 Specifies whether public key authentication is allowed.
 The default is
 .Cm yes .
+.It Cm RefuseConnection
+Indicates that
+.Xr sshd 8
+should unconditionally terminate the connection.
+Additionally, a
+.Cm refuseconnection
+penalty may be recorded against the source of the connection if
+.Cm PerSourcePenalties
+are enabled.
+This option is only really useful in a
+.Cm Match
+block.
 .It Cm RekeyLimit
 Specifies the maximum amount of data that may be transmitted or received
 before the session key is renegotiated, optionally followed by a maximum
@@ -1807,6 +1853,20 @@ via
 .Cm AcceptEnv
 or
 .Cm PermitUserEnvironment .
+.It Cm SshdAuthPath
+Overrides the default path to the
+.Cm sshd-auth
+binary that is invoked to complete user authentication.
+The default is
+.Pa /usr/libexec/sshd-auth .
+This option is intended for use by tests.
+.It Cm SshdSessionPath
+Overrides the default path to the
+.Cm sshd-session
+binary that is invoked to handle each connection.
+The default is
+.Pa /usr/libexec/sshd-session .
+This option is intended for use by tests.
 .It Cm StreamLocalBindMask
 Sets the octal file creation mode mask
 .Pq umask

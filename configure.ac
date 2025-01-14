@@ -114,11 +114,6 @@ AC_C_INLINE
 
 AC_CHECK_DECL([LLONG_MAX], [have_llong_max=1], , [#include <limits.h>])
 AC_CHECK_DECL([LONG_LONG_MAX], [have_long_long_max=1], , [#include <limits.h>])
-AC_CHECK_DECL([SYSTR_POLICY_KILL], [have_systr_policy_kill=1], , [
-	#include <sys/types.h>
-	#include <sys/param.h>
-	#include <dev/systrace.h>
-])
 AC_CHECK_DECL([RLIMIT_NPROC],
     [AC_DEFINE([HAVE_RLIMIT_NPROC], [], [sys/resource.h has RLIMIT_NPROC])], , [
 	#include <sys/types.h>
@@ -619,6 +614,9 @@ SPP_MSG="no"
 # the --with-solaris-privs option and --with-sandbox=solaris).
 SOLARIS_PRIVS="no"
 
+# Default shared library extension
+SHLIBEXT=".so"
+
 # Check for some target-specific stuff
 case "$host" in
 *-*-aix*)
@@ -630,6 +628,7 @@ case "$host" in
 	AC_MSG_CHECKING([if compiler allows macro redefinitions])
 	AC_COMPILE_IFELSE(
 	    [AC_LANG_PROGRAM([[
+#include <stdlib.h>
 #define testmacro foo
 #define testmacro bar]],
 	    [[ exit(0); ]])],
@@ -737,6 +736,7 @@ case "$host" in
 	# Cygwin defines optargs, optargs as declspec(dllimport) for historical
 	# reasons which cause compile warnings, so we disable those warnings.
 	OSSH_CHECK_CFLAG_COMPILE([-Wno-attributes])
+	SHLIBEXT=".dll"
 	;;
 *-*-dgux*)
 	AC_DEFINE([IP_TOS_IS_BROKEN], [1],
@@ -796,6 +796,7 @@ int main(void) { if (NSVersionOfRunTimeLibrary("System") >= (60 << 16))
 	# cf. Apple bug 3710161 (not public, but searchable)
 	AC_DEFINE([BROKEN_POLL], [1],
 	    [System poll(2) implementation is broken])
+	SHLIBEXT=".dylib"
 	;;
 *-*-dragonfly*)
 	SSHDLIBS="$SSHDLIBS"
@@ -1093,7 +1094,7 @@ mips-sony-bsd|mips-sony-newsos4)
 	AC_DEFINE([SSH_TUN_OPENBSD], [1], [Open tunnel devices the OpenBSD way])
 	AC_DEFINE([SYSLOG_R_SAFE_IN_SIGHAND], [1],
 	    [syslog_r function is safe to use in in a signal handler])
-	TEST_MALLOC_OPTIONS="AFGJPRX"
+	TEST_MALLOC_OPTIONS="SJRU"
 	;;
 *-*-solaris*)
 	if test "x$withval" != "xno" ; then
@@ -1347,6 +1348,13 @@ EOD
 	CFLAGS="$CFLAGS -D__NO_INCLUDE_WARN__"
 	AC_DEFINE([BROKEN_SETVBUF], [1],
 	    [LynxOS has broken setvbuf() implementation])
+	;;
+*-*-gnu*)
+	dnl GNU Hurd.  Needs to be after the linux and the other *-gnu entries.
+	dnl Target SUSv3/POSIX.1-2001 plus BSD specifics.
+	dnl _DEFAULT_SOURCE is the new name for _BSD_SOURCE
+	dnl _GNU_SOURCE is needed for setres*id prototypes.
+	CPPFLAGS="$CPPFLAGS -D_XOPEN_SOURCE=600 -D_BSD_SOURCE -D_DEFAULT_SOURCE -D_GNU_SOURCE"
 	;;
 esac
 
@@ -1765,6 +1773,48 @@ AC_ARG_WITH([libedit],
 	fi ]
 )
 
+# Check whether user wants wtmpdb support
+WTMPDB_MSG="no"
+AC_ARG_WITH([wtmpdb],
+	[  --with-wtmpdb[[=PATH]]   Enable wtmpdb support for sshd],
+	[ if test "x$withval" != "xno" ; then
+		if test "x$withval" = "xyes" ; then
+			if test "x$PKGCONFIG" != "xno"; then
+				AC_MSG_CHECKING([if $PKGCONFIG knows about wtmpdb])
+				if "$PKGCONFIG" libwtmpdb; then
+					AC_MSG_RESULT([yes])
+					use_pkgconfig_for_libwtmpdb=yes
+				else
+					AC_MSG_RESULT([no])
+				fi
+			fi
+		else
+			CPPFLAGS="$CPPFLAGS -I${withval}/include"
+			if test -n "${rpath_opt}"; then
+				LDFLAGS="-L${withval}/lib ${rpath_opt}${withval}/lib ${LDFLAGS}"
+			else
+				LDFLAGS="-L${withval}/lib ${LDFLAGS}"
+			fi
+		fi
+		if test "x$use_pkgconfig_for_libwtmpdb" = "xyes"; then
+			LIBWTMPDB=`$PKGCONFIG --libs libwtmpdb`
+			CPPFLAGS="$CPPFLAGS `$PKGCONFIG --cflags libwtmpdb`"
+		else
+			LIBWTMPDB="-lwtmpdb"
+		fi
+		OTHERLIBS=`echo $LIBWTMPDB | sed 's/-lwtmpdb//'`
+		AC_CHECK_LIB([wtmpdb], [wtmpdb_login],
+			[ AC_DEFINE([USE_WTMPDB], [1], [Use libwtmpdb for sshd])
+			  WTMPDB_MSG="yes"
+			  AC_SUBST([LIBWTMPDB])
+			],
+			[ AC_MSG_ERROR([libwtmpdb not found]) ],
+			[ $OTHERLIBS ]
+		)
+	fi ]
+)
+
+
 AUDIT_MODULE=none
 AC_ARG_WITH([audit],
 	[  --with-audit=module     Enable audit support (modules=debug,bsm,linux)],
@@ -1879,6 +1929,8 @@ AC_SUBST([PICFLAG])
 
 dnl    Checks for library functions. Please keep in alphabetical order
 AC_CHECK_FUNCS([ \
+	auth_hostok \
+	auth_timeok \
 	Blowfish_initstate \
 	Blowfish_expandstate \
 	Blowfish_expand0state \
@@ -2004,7 +2056,6 @@ AC_CHECK_FUNCS([ \
 	strtoll \
 	strtoul \
 	strtoull \
-	swap32 \
 	sysconf \
 	tcgetpgrp \
 	timegm \
@@ -2076,10 +2127,20 @@ AC_ARG_WITH([security-key-builtin],
 	[ enable_sk_internal=$withval ]
 )
 
+enable_sk_standalone=
+AC_ARG_WITH([security-key-standalone],
+	[  --with-security-key-standalone build standalone sk-libfido2 SecurityKeyProvider],
+	[ enable_sk_standalone=$withval ]
+)
+
 enable_dsa=
 AC_ARG_ENABLE([dsa-keys],
-	[  --disable-dsa-keys      disable DSA key support [no]],
-	[  enable_dsa="$enableval" ]
+	[  --enable-dsa-keys       enable DSA key support [no]],
+	[
+		if test "x$enableval" != "xno" ; then
+			enable_dsa=1
+		fi
+	]
 )
 
 AC_SEARCH_LIBS([dlopen], [dl])
@@ -2970,6 +3031,8 @@ if test "x$openssl" = "xyes" ; then
 		BN_is_prime_ex \
 		DES_crypt \
 		DSA_generate_parameters_ex \
+		EVP_DigestSign \
+		EVP_DigestVerify \
 		EVP_DigestFinal_ex \
 		EVP_DigestInit_ex \
 		EVP_MD_CTX_cleanup \
@@ -3188,8 +3251,9 @@ if test "x$openssl" = "xyes" ; then
 			AC_MSG_RESULT([no])
 		]
 	)
+
 	openssl_dsa=no
-	if test -z "$enable_dsa" || test "x$enable_dsa" = "xyes"; then
+	if test ! -z "$enable_dsa" ; then
 		AC_CHECK_DECLS([OPENSSL_NO_DSA], [], [
 			AC_CHECK_DECLS([OPENSSL_IS_BORINGSSL], [],
 			    [ openssl_dsa=yes ],
@@ -3199,22 +3263,12 @@ if test "x$openssl" = "xyes" ; then
 		    [ #include <openssl/opensslconf.h> ]
 		)
 		AC_MSG_CHECKING([whether to enable DSA key support])
-		if test -z "$enable_dsa"; then
-			if test "x$openssl_dsa" = "xno"; then
-				AC_MSG_RESULT([not supported by OpenSSL])
-			else
-				AC_MSG_RESULT([yes])
-				AC_DEFINE([WITH_DSA], [1],
-				   [DSA keys enabled by default])
-			fi
+		if test "x$openssl_dsa" = "xno"; then
+			AC_MSG_ERROR([DSA requested but not supported by OpenSSL])
 		else
-			if test "x$openssl_dsa" = "xno"; then
-				AC_MSG_ERROR([DSA requested but not supported by OpenSSL])
-			else
-				AC_MSG_RESULT([yes])
-				AC_DEFINE([WITH_DSA], [1],
-				   [DSA keys explicitly enabled])
-			fi
+			AC_MSG_RESULT([yes])
+			AC_DEFINE([WITH_DSA], [1],
+			   [DSA keys explicitly enabled])
 		fi
 	fi
 fi
@@ -3314,6 +3368,16 @@ if test "x$enable_sk" = "xyes" -a "x$enable_sk_internal" != "xno" ; then
 		])
 		LIBS="$saved_LIBS"
 	fi
+fi
+
+# Check for standalone SecurityKeyProvider
+AC_MSG_CHECKING([whether to build standalone sk-libfido2])
+if test "x$enable_sk_standalone" = "xyes" ; then
+	AC_MSG_RESULT([yes])
+	AC_SUBST([SK_STANDALONE], [sk-libfido2$SHLIBEXT])
+else
+	AC_MSG_RESULT([no])
+	AC_SUBST([SK_STANDALONE], [""])
 fi
 
 AC_CHECK_FUNCS([ \
@@ -3608,7 +3672,7 @@ AC_CHECK_TYPES([nfds_t], , , [
 # Decide which sandbox style to use
 sandbox_arg=""
 AC_ARG_WITH([sandbox],
-	[  --with-sandbox=style    Specify privilege separation sandbox (no, capsicum, darwin, rlimit, seccomp_filter, systrace, pledge)],
+	[  --with-sandbox=style    Specify privilege separation sandbox (no, capsicum, darwin, rlimit, seccomp_filter)],
 	[
 		if test "x$withval" = "xyes" ; then
 			sandbox_arg=""
@@ -3725,19 +3789,7 @@ if test "x$sandbox_arg" != "xno"; then
     )
 fi
 
-if test "x$sandbox_arg" = "xpledge" || \
-   ( test -z "$sandbox_arg" && test "x$ac_cv_func_pledge" = "xyes" ) ; then
-	test "x$ac_cv_func_pledge" != "xyes" && \
-		AC_MSG_ERROR([pledge sandbox requires pledge(2) support])
-	SANDBOX_STYLE="pledge"
-	AC_DEFINE([SANDBOX_PLEDGE], [1], [Sandbox using pledge(2)])
-elif test "x$sandbox_arg" = "xsystrace" || \
-   ( test -z "$sandbox_arg" && test "x$have_systr_policy_kill" = "x1" ) ; then
-	test "x$have_systr_policy_kill" != "x1" && \
-		AC_MSG_ERROR([systrace sandbox requires systrace headers and SYSTR_POLICY_KILL support])
-	SANDBOX_STYLE="systrace"
-	AC_DEFINE([SANDBOX_SYSTRACE], [1], [Sandbox using systrace(4)])
-elif test "x$sandbox_arg" = "xdarwin" || \
+if test "x$sandbox_arg" = "xdarwin" || \
      ( test -z "$sandbox_arg" && test "x$ac_cv_func_sandbox_init" = "xyes" && \
        test "x$ac_cv_header_sandbox_h" = "xyes") ; then
 	test "x$ac_cv_func_sandbox_init" != "xyes" -o \
@@ -4356,7 +4408,11 @@ int main(void)
 	long long num = 0x7fffffffffffffffll;
 #endif
 	strcpy(expected_out, "9223372036854775807");
+#if (SIZEOF_LONG_INT == 8)
+	snprintf(buf, mazsize, "%ld", num);
+#else
 	snprintf(buf, mazsize, "%lld", num);
+#endif
 	if(strcmp(buf, expected_out) != 0)
 		exit(1);
 	exit(0);

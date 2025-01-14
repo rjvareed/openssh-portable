@@ -1,4 +1,4 @@
-#	$OpenBSD: test-exec.sh,v 1.114 2024/06/06 19:48:40 djm Exp $
+#	$OpenBSD: test-exec.sh,v 1.122 2024/12/06 07:05:54 dtucker Exp $
 #	Placed in the Public Domain.
 
 #SUDO=sudo
@@ -91,6 +91,7 @@ SSHKEYSCAN=ssh-keyscan
 SFTP=sftp
 SFTPSERVER=/usr/libexec/openssh/sftp-server
 SSHD_SESSION=/usr/libexec/sshd-session
+SSHD_AUTH=/usr/libexec/sshd-auth
 SCP=scp
 
 # Set by make_tmpdir() on demand (below).
@@ -118,6 +119,9 @@ if [ "x$TEST_SSH_SSH" != "x" ]; then
 fi
 if [ "x$TEST_SSH_SSHD_SESSION" != "x" ]; then
 	SSHD_SESSION="${TEST_SSH_SSHD_SESSION}"
+fi
+if [ "x$TEST_SSH_SSHD_AUTH" != "x" ]; then
+	SSHD_AUTH="${TEST_SSH_SSHD_AUTH}"
 fi
 if [ "x$TEST_SSH_SSHD" != "x" ]; then
 	SSHD="${TEST_SSH_SSHD}"
@@ -178,6 +182,11 @@ fi
 case "$SSHD" in
 /*) ;;
 *) SSHD=`which $SSHD` ;;
+esac
+
+case "$SSH" in
+/*) ;;
+*) SSH=`which $SSH` ;;
 esac
 
 case "$SSHAGENT" in
@@ -305,6 +314,7 @@ fi
 # to preserve our debug logging.  In the rare instance where -q is desirable
 # -qq is equivalent and is not removed.
 SSHLOGWRAP=$OBJ/ssh-log-wrapper.sh
+rm -f ${SSHLOGWRAP}
 cat >$SSHLOGWRAP <<EOD
 #!/bin/sh
 timestamp="\`$OBJ/timestamp\`"
@@ -323,6 +333,7 @@ REAL_SSHD="$SSHD"
 SSH="$SSHLOGWRAP"
 
 SSHDLOGWRAP=$OBJ/sshd-log-wrapper.sh
+rm -f ${SSHDLOGWRAP}
 cat >$SSHDLOGWRAP <<EOD
 #!/bin/sh
 timestamp="\`$OBJ/timestamp\`"
@@ -456,6 +467,7 @@ make_tmpdir ()
 
 stop_sshd ()
 {
+	[ -z $PIDFILE ] && return
 	[ -f $PIDFILE ] || return
 	pid=`$SUDO cat $PIDFILE`
 	if [ "X$pid" = "X" ]; then
@@ -620,6 +632,7 @@ cat << EOF > $OBJ/sshd_config
 	AcceptEnv		_XXX_TEST
 	Subsystem	sftp	$SFTPSERVER
 	SshdSessionPath		$SSHD_SESSION
+	SshdAuthPath		$SSHD_AUTH
 	PerSourcePenalties	no
 EOF
 
@@ -845,15 +858,25 @@ esac
 if test "$REGRESS_INTEROP_DROPBEAR" = "yes" ; then
 	trace Create dropbear keys and add to authorized_keys
 	mkdir -p $OBJ/.dropbear
-	for i in rsa ecdsa ed25519 dss; do
-		if [ ! -f "$OBJ/.dropbear/id_$i" ]; then
-			($DROPBEARKEY -t $i -f $OBJ/.dropbear/id_$i
-			$DROPBEARCONVERT dropbear openssh \
-			    $OBJ/.dropbear/id_$i $OBJ/.dropbear/ossh.id_$i
-			) > /dev/null 2>&1
+	kt="ed25519"
+	for i in dss rsa ecdsa; do
+		if $SSH -Q key-plain | grep "$i" >/dev/null; then
+			kt="$kt $i"
+		else
+			rm -f "$OBJ/.dropbear/id_$i"
 		fi
+	done
+	for i in $kt; do
+		if [ ! -f "$OBJ/.dropbear/id_$i" ]; then
+			verbose Create dropbear key type $i
+			$DROPBEARKEY -t $i -f $OBJ/.dropbear/id_$i \
+			    >/dev/null 2>&1
+		fi
+		$DROPBEARCONVERT dropbear openssh $OBJ/.dropbear/id_$i \
+		    $OBJ/.dropbear/ossh.id_$i >/dev/null 2>&1
 		$SSHKEYGEN -y -f $OBJ/.dropbear/ossh.id_$i \
 		   >>$OBJ/authorized_keys_$USER
+		rm -f $OBJ/.dropbear/id_$i.pub $OBJ/.dropbear/ossh.id_$i
 	done
 fi
 
@@ -874,6 +897,7 @@ chmod a+x $OBJ/ssh_proxy.sh
 
 start_sshd ()
 {
+	PIDFILE=$OBJ/pidfile
 	# start sshd
 	logfile="${TEST_SSH_LOGDIR}/sshd.`$OBJ/timestamp`.$$.log"
 	$SUDO ${SSHD} -f $OBJ/sshd_config "$@" -t || fatal "sshd_config broken"
@@ -886,6 +910,7 @@ start_sshd ()
 		i=`expr $i + 1`
 		sleep $i
 	done
+	rm -f ${TEST_SSHD_LOGFILE}
 	ln -f -s ${logfile} $TEST_SSHD_LOGFILE
 
 	test -f $PIDFILE || fatal "no sshd running on port $PORT"
