@@ -1,4 +1,4 @@
-/* $OpenBSD: sshconnect2.c,v 1.376 2024/10/18 05:45:40 djm Exp $ */
+/* $OpenBSD: sshconnect2.c,v 1.382 2026/02/16 00:45:41 dtucker Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  * Copyright (c) 2008 Damien Miller.  All rights reserved.
@@ -29,12 +29,12 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/queue.h>
 #include <sys/stat.h>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <netdb.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
@@ -44,8 +44,6 @@
 #if defined(HAVE_STRNVIS) && defined(HAVE_VIS_H) && !defined(BROKEN_STRNVIS)
 #include <vis.h>
 #endif
-
-#include "openbsd-compat/sys-queue.h"
 
 #include "xmalloc.h"
 #include "ssh.h"
@@ -58,7 +56,6 @@
 #include "kex.h"
 #include "sshconnect.h"
 #include "authfile.h"
-#include "dh.h"
 #include "authfd.h"
 #include "log.h"
 #include "misc.h"
@@ -68,7 +65,6 @@
 #include "canohost.h"
 #include "msg.h"
 #include "pathnames.h"
-#include "uidswap.h"
 #include "hostfile.h"
 #include "ssherr.h"
 #include "utf8.h"
@@ -99,7 +95,7 @@ verify_host_key_callback(struct sshkey *hostkey, struct ssh *ssh)
 	    options.required_rsa_size)) != 0)
 		fatal_r(r, "Bad server host key");
 	if (verify_host_key(xxx_host, xxx_hostaddr, hostkey,
-	    xxx_conn_info) == -1)
+	    xxx_conn_info) != 0)
 		fatal("Host key verification failed.");
 	return 0;
 }
@@ -699,6 +695,7 @@ input_userauth_pk_ok(int type, u_int32_t seq, struct ssh *ssh)
 
 	if ((pktype = sshkey_type_from_name(pkalg)) == KEY_UNSPEC) {
 		debug_f("server sent unknown pkalg %s", pkalg);
+		r = SSH_ERR_INVALID_FORMAT;
 		goto done;
 	}
 	if ((r = sshkey_from_blob(pkblob, blen, &key)) != 0) {
@@ -709,6 +706,7 @@ input_userauth_pk_ok(int type, u_int32_t seq, struct ssh *ssh)
 		error("input_userauth_pk_ok: type mismatch "
 		    "for decoded key (received %d, expected %d)",
 		    key->type, pktype);
+		r = SSH_ERR_INVALID_FORMAT;
 		goto done;
 	}
 
@@ -728,6 +726,7 @@ input_userauth_pk_ok(int type, u_int32_t seq, struct ssh *ssh)
 		    SSH_FP_DEFAULT);
 		error_f("server replied with unknown key: %s %s",
 		    sshkey_type(key), fp == NULL ? "<ERROR>" : fp);
+		r = SSH_ERR_INVALID_FORMAT;
 		goto done;
 	}
 	ident = format_identity(id);
@@ -1270,7 +1269,8 @@ identity_sign(struct identity *id, u_char **sigp, size_t *lenp,
 	 * PKCS#11 tokens may not support all signature algorithms,
 	 * so check what we get back.
 	 */
-	if ((r = sshkey_check_sigtype(*sigp, *lenp, alg)) != 0) {
+	if ((id->key->flags & SSHKEY_FLAG_EXT) != 0 &&
+	    (r = sshkey_check_sigtype(*sigp, *lenp, alg)) != 0) {
 		debug_fr(r, "sshkey_check_sigtype");
 		goto out;
 	}
@@ -1338,7 +1338,7 @@ sign_and_send_pubkey(struct ssh *ssh, Identity *id)
 	 * This will try to set sign_id to the private key that will perform
 	 * the signature.
 	 */
-	if (sshkey_is_cert(id->key)) {
+	if (id->agent_fd == -1 && sshkey_is_cert(id->key)) {
 		TAILQ_FOREACH(private_id, &authctxt->keys, next) {
 			if (sshkey_equal_public(id->key, private_id->key) &&
 			    id->key->type != private_id->key->type) {
@@ -1812,7 +1812,7 @@ pubkey_prepare(struct ssh *ssh, Authctxt *authctxt)
 		TAILQ_REMOVE(preferred, id, next);
 		sshkey_free(id->key);
 		free(id->filename);
-		memset(id, 0, sizeof(*id));
+		freezero(id, sizeof(*id));
 	}
 	/* List the keys we plan on using */
 	TAILQ_FOREACH_SAFE(id, preferred, next, id2) {

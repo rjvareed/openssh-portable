@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-agent.c,v 1.309 2024/11/06 22:51:26 djm Exp $ */
+/* $OpenBSD: ssh-agent.c,v 1.319 2026/02/16 23:47:06 jsg Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -37,17 +37,13 @@
 #include "includes.h"
 
 #include <sys/types.h>
+#include <sys/time.h>
+#include <sys/queue.h>
 #include <sys/resource.h>
-#include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
-#ifdef HAVE_SYS_TIME_H
-# include <sys/time.h>
-#endif
-#ifdef HAVE_SYS_UN_H
-# include <sys/un.h>
-#endif
-#include "openbsd-compat/sys-queue.h"
 
 #ifdef WITH_OPENSSL
 #include <openssl/evp.h>
@@ -56,23 +52,17 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
-#ifdef HAVE_PATHS_H
-# include <paths.h>
-#endif
-#ifdef HAVE_POLL_H
-# include <poll.h>
-#endif
+#include <paths.h>
+#include <poll.h>
 #include <signal.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
+#include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
+#include <limits.h>
+#include <time.h>
 #include <unistd.h>
-#ifdef HAVE_UTIL_H
-# include <util.h>
-#endif
+#include <util.h>
 
 #include "xmalloc.h"
 #include "ssh.h"
@@ -172,8 +162,8 @@ static sig_atomic_t signalled_keydrop;
 pid_t cleanup_pid = 0;
 
 /* pathname and directory for AUTH_SOCKET */
-char socket_name[PATH_MAX];
-char socket_dir[PATH_MAX];
+static char *socket_name;
+static char socket_dir[PATH_MAX];
 
 /* Pattern-list of allowed PKCS#11/Security key paths */
 static char *allowed_providers;
@@ -402,7 +392,7 @@ match_key_hop(const char *tag, const struct sshkey *key,
 			return -1; /* shouldn't happen */
 		if (!sshkey_equal(key->cert->signature_key, dch->keys[i]))
 			continue;
-		if (sshkey_cert_check_host(key, hostname, 1,
+		if (sshkey_cert_check_host(key, hostname,
 		    SSH_ALLOWED_CA_SIGALGS, &reason) != 0) {
 			debug_f("cert %s / hostname %s rejected: %s",
 			    key->cert->key_id, hostname, reason);
@@ -644,8 +634,7 @@ process_request_identities(SocketEntry *e)
 		/* identity not visible, don't include in response */
 		if (identity_permitted(id, e, NULL, NULL, NULL) != 0)
 			continue;
-		if ((r = sshkey_puts_opts(id->key, keys,
-		    SSHKEY_SERIALIZE_INFO)) != 0 ||
+		if ((r = sshkey_puts(id->key, keys)) != 0 ||
 		    (r = sshbuf_put_cstring(keys, id->comment)) != 0) {
 			error_fr(r, "compose key/comment");
 			continue;
@@ -1220,6 +1209,7 @@ parse_key_constraint_extension(struct sshbuf *m, char **sk_providerp,
 	    "restrict-destination-v00@openssh.com") == 0) {
 		if (*dcsp != NULL) {
 			error_f("%s already set", ext_name);
+			r = SSH_ERR_INVALID_FORMAT;
 			goto out;
 		}
 		if ((r = sshbuf_froms(m, &b)) != 0) {
@@ -1229,6 +1219,7 @@ parse_key_constraint_extension(struct sshbuf *m, char **sk_providerp,
 		while (sshbuf_len(b) != 0) {
 			if (*ndcsp >= AGENT_MAX_DEST_CONSTRAINTS) {
 				error_f("too many %s constraints", ext_name);
+				r = SSH_ERR_INVALID_FORMAT;
 				goto out;
 			}
 			*dcsp = xrecallocarray(*dcsp, *ndcsp, *ndcsp + 1,
@@ -1246,6 +1237,7 @@ parse_key_constraint_extension(struct sshbuf *m, char **sk_providerp,
 		}
 		if (*certs != NULL) {
 			error_f("%s already set", ext_name);
+			r = SSH_ERR_INVALID_FORMAT;
 			goto out;
 		}
 		if ((r = sshbuf_get_u8(m, &v)) != 0 ||
@@ -1257,6 +1249,7 @@ parse_key_constraint_extension(struct sshbuf *m, char **sk_providerp,
 		while (sshbuf_len(b) != 0) {
 			if (*ncerts >= AGENT_MAX_EXT_CERTS) {
 				error_f("too many %s constraints", ext_name);
+				r = SSH_ERR_INVALID_FORMAT;
 				goto out;
 			}
 			*certs = xrecallocarray(*certs, *ncerts, *ncerts + 1,
@@ -1288,7 +1281,7 @@ parse_key_constraints(struct sshbuf *m, struct sshkey *k, time_t *deathp,
 {
 	u_char ctype;
 	int r;
-	u_int seconds, maxsign = 0;
+	u_int seconds;
 
 	while (sshbuf_len(m)) {
 		if ((r = sshbuf_get_u8(m, &ctype)) != 0) {
@@ -1316,26 +1309,6 @@ parse_key_constraints(struct sshbuf *m, struct sshkey *k, time_t *deathp,
 				goto out;
 			}
 			*confirmp = 1;
-			break;
-		case SSH_AGENT_CONSTRAIN_MAXSIGN:
-			if (k == NULL) {
-				error_f("maxsign not valid here");
-				r = SSH_ERR_INVALID_FORMAT;
-				goto out;
-			}
-			if (maxsign != 0) {
-				error_f("maxsign already set");
-				r = SSH_ERR_INVALID_FORMAT;
-				goto out;
-			}
-			if ((r = sshbuf_get_u32(m, &maxsign)) != 0) {
-				error_fr(r, "parse maxsign constraint");
-				goto out;
-			}
-			if ((r = sshkey_enable_maxsign(k, maxsign)) != 0) {
-				error_fr(r, "enable maxsign");
-				goto out;
-			}
 			break;
 		case SSH_AGENT_CONSTRAIN_EXTENSION:
 			if ((r = parse_key_constraint_extension(m,
@@ -1757,6 +1730,7 @@ process_ext_session_bind(SocketEntry *e)
 	/* record new key/sid */
 	if (e->nsession_ids >= AGENT_MAX_SESSION_IDS) {
 		error_f("too many session IDs recorded");
+		r = -1;
 		goto out;
 	}
 	e->session_ids = xrecallocarray(e->session_ids, e->nsession_ids,
@@ -1782,6 +1756,26 @@ process_ext_session_bind(SocketEntry *e)
 	return r == 0 ? 1 : 0;
 }
 
+static int
+process_ext_query(SocketEntry *e)
+{
+	int r;
+	struct sshbuf *msg = NULL;
+
+	debug2_f("entering");
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u8(msg, SSH_AGENT_EXTENSION_RESPONSE)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, "query")) != 0 ||
+	    /* string[]     supported extension types */
+	    (r = sshbuf_put_cstring(msg, "session-bind@openssh.com")) != 0)
+		fatal_fr(r, "compose");
+	if ((r = sshbuf_put_stringb(e->output, msg)) != 0)
+		fatal_fr(r, "enqueue");
+	sshbuf_free(msg);
+	return 1;
+}
+
 static void
 process_extension(SocketEntry *e)
 {
@@ -1793,7 +1787,9 @@ process_extension(SocketEntry *e)
 		error_fr(r, "parse");
 		goto send;
 	}
-	if (strcmp(name, "session-bind@openssh.com") == 0)
+	if (strcmp(name, "query") == 0)
+		success = process_ext_query(e);
+	else if (strcmp(name, "session-bind@openssh.com") == 0)
 		success = process_ext_session_bind(e);
 	else
 		debug_f("unsupported extension \"%s\"", name);
@@ -2157,8 +2153,11 @@ cleanup_socket(void)
 	if (cleanup_pid != 0 && getpid() != cleanup_pid)
 		return;
 	debug_f("cleanup");
-	if (socket_name[0])
+	if (socket_name != NULL) {
 		unlink(socket_name);
+		free(socket_name);
+		socket_name = NULL;
+	}
 	if (socket_dir[0])
 		rmdir(socket_dir);
 }
@@ -2203,20 +2202,25 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: ssh-agent [-c | -s] [-Dd] [-a bind_address] [-E fingerprint_hash]\n"
+	    "usage: ssh-agent [-c | -s] [-DdTU] [-a bind_address] [-E fingerprint_hash]\n"
 	    "                 [-O option] [-P allowed_providers] [-t life]\n"
-	    "       ssh-agent [-a bind_address] [-E fingerprint_hash] [-O option]\n"
+	    "       ssh-agent [-TU] [-a bind_address] [-E fingerprint_hash] [-O option]\n"
 	    "                 [-P allowed_providers] [-t life] command [arg ...]\n"
-	    "       ssh-agent [-c | -s] -k\n");
+	    "       ssh-agent [-c | -s] -k\n"
+	    "       ssh-agent -u\n");
 	exit(1);
 }
 
 int
 main(int ac, char **av)
 {
-	int c_flag = 0, d_flag = 0, D_flag = 0, k_flag = 0, s_flag = 0;
+	int c_flag = 0, d_flag = 0, D_flag = 0, k_flag = 0;
+	int s_flag = 0, T_flag = 0, u_flag = 0, U_flag = 0;
 	int sock = -1, ch, result, saved_errno;
-	char *shell, *format, *fdstr, *pidstr, *agentsocket = NULL;
+	pid_t pid;
+ 	char *homedir = NULL, *shell, *format, *pidstr, *agentsocket = NULL;
+	char *cp, pidstrbuf[1 + 3 * sizeof pid];
+	char *fdstr;
 	const char *errstr = NULL;
 	const char *ccp;
 #ifdef HAVE_SETRLIMIT
@@ -2224,8 +2228,6 @@ main(int ac, char **av)
 #endif
 	extern int optind;
 	extern char *optarg;
-	pid_t pid;
-	char pidstrbuf[1 + 3 * sizeof pid];
 	size_t len;
 	mode_t prev_mask;
 	struct timespec timeout;
@@ -2233,6 +2235,7 @@ main(int ac, char **av)
 	size_t npfd = 0;
 	u_int maxfds;
 	sigset_t nsigset, osigset;
+	int socket_activated = 0;
 
 	/* Ensure that fds 0, 1 and 2 are open or directed to /dev/null */
 	sanitise_stdfd();
@@ -2251,7 +2254,7 @@ main(int ac, char **av)
 	__progname = ssh_get_progname(av[0]);
 	seed_rng();
 
-	while ((ch = getopt(ac, av, "cDdksE:a:O:P:t:")) != -1) {
+	while ((ch = getopt(ac, av, "cDdksTuUE:a:O:P:t:")) != -1) {
 		switch (ch) {
 		case 'E':
 			fingerprint_hash = ssh_digest_alg_by_name(optarg);
@@ -2308,6 +2311,15 @@ main(int ac, char **av)
 				usage();
 			}
 			break;
+		case 'T':
+			T_flag++;
+			break;
+		case 'u':
+			u_flag++;
+			break;
+		case 'U':
+			U_flag++;
+			break;
 		default:
 			usage();
 		}
@@ -2315,8 +2327,13 @@ main(int ac, char **av)
 	ac -= optind;
 	av += optind;
 
-	if (ac > 0 && (c_flag || k_flag || s_flag || d_flag || D_flag))
+	if (ac > 0 &&
+	    (c_flag || k_flag || s_flag || d_flag || D_flag || u_flag))
 		usage();
+
+	log_init(__progname,
+	    d_flag ? SYSLOG_LEVEL_DEBUG3 : SYSLOG_LEVEL_INFO,
+	    SYSLOG_FACILITY_AUTH, 1);
 
 	if (allowed_providers == NULL)
 		allowed_providers = xstrdup(DEFAULT_ALLOWED_PROVIDERS);
@@ -2353,6 +2370,14 @@ main(int ac, char **av)
 		printf("echo Agent pid %ld killed;\n", (long)pid);
 		exit(0);
 	}
+	if (u_flag) {
+		if ((homedir = get_homedir()) == NULL)
+			fatal("Couldn't determine home directory");
+		agent_cleanup_stale(homedir, u_flag > 1);
+		printf("Deleted stale agent sockets in ~/%s\n",
+		    _PATH_SSH_AGENT_SOCKET_DIR);
+		exit(0);
+	}
 
 	/*
 	 * Minimum file descriptors:
@@ -2384,24 +2409,44 @@ main(int ac, char **av)
 			fatal("bad LISTEN_PID: %d vs pid %d", pid, getpid());
 		debug("using socket activation on fd=3");
 		sock = 3;
+		socket_activated = 1;
 	}
 
-	/* Otherwise, create private directory for agent socket */
-	if (sock == -1) {
-		if (agentsocket == NULL) {
+	if (sock == -1 && agentsocket == NULL && !T_flag) {
+		/* Default case: ~/.ssh/agent/[socket] */
+		if ((homedir = get_homedir()) == NULL)
+			fatal("Couldn't determine home directory");
+		if (!U_flag)
+			agent_cleanup_stale(homedir, 0);
+		if (agent_listener(homedir, "agent", &sock, &socket_name) != 0)
+			fatal_f("Couldn't prepare agent socket");
+		free(homedir);
+	} else if (sock == -1) {
+		if (T_flag) {
+			/*
+			 * Create private directory for agent socket
+			 * in $TMPDIR.
+			 */
 			mktemp_proto(socket_dir, sizeof(socket_dir));
 			if (mkdtemp(socket_dir) == NULL) {
 				perror("mkdtemp: private socket dir");
 				exit(1);
 			}
-			snprintf(socket_name, sizeof socket_name,
-			   "%s/agent.%ld", socket_dir,
-		    (long)parent_pid);
+			xasprintf(&socket_name, "%s/agent.%ld",
+			    socket_dir, (long)parent_pid);
 		} else {
 			/* Try to use specified agent socket */
 			socket_dir[0] = '\0';
-			strlcpy(socket_name, agentsocket, sizeof socket_name);
+			socket_name = xstrdup(agentsocket);
 		}
+		/* Listen on socket */
+		prev_mask = umask(0177);
+		if ((sock = unix_listener(socket_name,
+		    SSH_LISTEN_BACKLOG, 0)) < 0) {
+			*socket_name = '\0'; /* Don't unlink existing file */
+			cleanup_exit(1);
+		}
+		umask(prev_mask);
 	}
 
 	closefrom(sock == -1 ? STDERR_FILENO + 1 : sock + 1);
@@ -2429,11 +2474,13 @@ main(int ac, char **av)
 		log_init(__progname,
 		    d_flag ? SYSLOG_LEVEL_DEBUG3 : SYSLOG_LEVEL_INFO,
 		    SYSLOG_FACILITY_AUTH, 1);
-		if (socket_name[0] != '\0') {
+		if (socket_name != NULL) {
+			cp = argv_assemble(1, &socket_name);
 			format = c_flag ?
 			    "setenv %s %s;\n" : "%s=%s; export %s;\n";
-			printf(format, SSH_AUTHSOCKET_ENV_NAME, socket_name,
+			printf(format, SSH_AUTHSOCKET_ENV_NAME, cp,
 			    SSH_AUTHSOCKET_ENV_NAME);
+			free(cp);
 			printf("echo Agent pid %ld;\n", (long)parent_pid);
 			fflush(stdout);
 		}
@@ -2449,10 +2496,12 @@ main(int ac, char **av)
 		snprintf(pidstrbuf, sizeof pidstrbuf, "%ld", (long)pid);
 		if (ac == 0) {
 			format = c_flag ? "setenv %s %s;\n" : "%s=%s; export %s;\n";
-			printf(format, SSH_AUTHSOCKET_ENV_NAME, socket_name,
+			cp = argv_assemble(1, &socket_name);
+			printf(format, SSH_AUTHSOCKET_ENV_NAME, cp,
 			    SSH_AUTHSOCKET_ENV_NAME);
 			printf(format, SSH_AGENTPID_ENV_NAME, pidstrbuf,
 			    SSH_AGENTPID_ENV_NAME);
+			free(cp);
 			printf("echo Agent pid %ld;\n", (long)pid);
 			exit(0);
 		}
@@ -2517,11 +2566,12 @@ skip:
 		sigprocmask(SIG_BLOCK, &nsigset, &osigset);
 		if (signalled_exit != 0) {
 			logit("exiting on signal %d", (int)signalled_exit);
-			cleanup_exit(2);
+			cleanup_exit((signalled_exit == SIGTERM &&
+			    socket_activated) ? 0 : 2);
 		}
 		if (signalled_keydrop) {
 			logit("signal %d received; removing all keys",
-			    signalled_keydrop);
+			    (int)signalled_keydrop);
 			remove_all_identities();
 			signalled_keydrop = 0;
 		}

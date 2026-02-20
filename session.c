@@ -1,4 +1,4 @@
-/* $OpenBSD: session.c,v 1.340 2024/12/06 06:55:28 dtucker Exp $ */
+/* $OpenBSD: session.c,v 1.347 2026/02/08 15:28:01 dtucker Exp $ */
 /*
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
  *                    All rights reserved
@@ -36,12 +36,11 @@
 #include "includes.h"
 
 #include <sys/types.h>
-#ifdef HAVE_SYS_STAT_H
-# include <sys/stat.h>
-#endif
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/un.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/queue.h>
 
 #include <arpa/inet.h>
 
@@ -50,9 +49,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <netdb.h>
-#ifdef HAVE_PATHS_H
 #include <paths.h>
-#endif
 #include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
@@ -62,7 +59,6 @@
 #include <unistd.h>
 #include <limits.h>
 
-#include "openbsd-compat/sys-queue.h"
 #include "xmalloc.h"
 #include "ssh.h"
 #include "ssh2.h"
@@ -75,9 +71,7 @@
 #include "channels.h"
 #include "sshkey.h"
 #include "cipher.h"
-#ifdef GSSAPI
-#include "ssh-gss.h"
-#endif
+#include "kex.h"
 #include "hostfile.h"
 #include "auth.h"
 #include "auth-options.h"
@@ -90,7 +84,9 @@
 #include "serverloop.h"
 #include "canohost.h"
 #include "session.h"
-#include "kex.h"
+#ifdef GSSAPI
+#include "ssh-gss.h"
+#endif
 #include "monitor_wrap.h"
 #include "sftp.h"
 #include "atomicio.h"
@@ -143,9 +139,6 @@ static int session_pty_req(struct ssh *, Session *);
 extern ServerOptions options;
 extern char *__progname;
 extern int debug_flag;
-extern u_int utmp_len;
-extern int startup_pipe;
-extern void destroy_sensitive_data(void);
 extern struct sshbuf *loginmsg;
 extern struct sshauthopt *auth_opts;
 extern char *tun_fwd_ifnames; /* serverloop.c */
@@ -175,7 +168,6 @@ static char *auth_info_file = NULL;
 
 /* Name and directory of socket for authentication agent forwarding. */
 static char *auth_sock_name = NULL;
-static char *auth_sock_dir = NULL;
 
 /* removes the agent forwarding socket */
 
@@ -185,7 +177,6 @@ auth_sock_cleanup_proc(struct passwd *pw)
 	if (auth_sock_name != NULL) {
 		temporarily_use_uid(pw);
 		unlink(auth_sock_name);
-		rmdir(auth_sock_dir);
 		auth_sock_name = NULL;
 		restore_uid();
 	}
@@ -205,31 +196,14 @@ auth_input_request_forwarding(struct ssh *ssh, struct passwd * pw)
 	/* Temporarily drop privileged uid for mkdir/bind. */
 	temporarily_use_uid(pw);
 
-	/* Allocate a buffer for the socket name, and format the name. */
-	auth_sock_dir = xstrdup("/tmp/ssh-XXXXXXXXXX");
-
-	/* Create private directory for socket */
-	if (mkdtemp(auth_sock_dir) == NULL) {
+	if (agent_listener(pw->pw_dir, "sshd", &sock, &auth_sock_name) != 0) {
+		/* a more detailed error is already logged */
 		ssh_packet_send_debug(ssh, "Agent forwarding disabled: "
-		    "mkdtemp() failed: %.100s", strerror(errno));
+		    "couldn't create listener socket");
 		restore_uid();
-		free(auth_sock_dir);
-		auth_sock_dir = NULL;
 		goto authsock_err;
 	}
-
-	xasprintf(&auth_sock_name, "%s/agent.%ld",
-	    auth_sock_dir, (long) getpid());
-
-	/* Start a Unix listener on auth_sock_name. */
-	sock = unix_listener(auth_sock_name, SSH_LISTEN_BACKLOG, 0);
-
-	/* Restore the privileged uid. */
 	restore_uid();
-
-	/* Check for socket/bind/listen failure. */
-	if (sock < 0)
-		goto authsock_err;
 
 	/* Allocate a channel for the authentication agent socket. */
 	nc = channel_new(ssh, "auth-listener",
@@ -241,16 +215,9 @@ auth_input_request_forwarding(struct ssh *ssh, struct passwd * pw)
 
  authsock_err:
 	free(auth_sock_name);
-	if (auth_sock_dir != NULL) {
-		temporarily_use_uid(pw);
-		rmdir(auth_sock_dir);
-		restore_uid();
-		free(auth_sock_dir);
-	}
 	if (sock != -1)
 		close(sock);
 	auth_sock_name = NULL;
-	auth_sock_dir = NULL;
 	return 0;
 }
 
@@ -347,7 +314,7 @@ do_authenticated(struct ssh *ssh, Authctxt *authctxt)
 
 	auth_log_authopts("active", auth_opts, 0);
 
-	/* setup the channel layer */
+	/* set up the channel layer */
 	/* XXX - streamlocal? */
 	set_fwdpermit_from_authopts(ssh, auth_opts);
 
@@ -524,9 +491,6 @@ do_exec_no_pty(struct ssh *ssh, Session *s, const char *command)
 #endif
 
 	s->pid = pid;
-	/* Set interactive/non-interactive mode. */
-	ssh_packet_set_interactive(ssh, s->display != NULL,
-	    options.ip_qos_interactive, options.ip_qos_bulk);
 
 	/*
 	 * Clear loginmsg, since it's the child's responsibility to display
@@ -654,8 +618,6 @@ do_exec_pty(struct ssh *ssh, Session *s, const char *command)
 
 	/* Enter interactive session. */
 	s->ptymaster = ptymaster;
-	ssh_packet_set_interactive(ssh, 1,
-	    options.ip_qos_interactive, options.ip_qos_bulk);
 	session_set_fds(ssh, s, ptyfd, fdout, -1, 1, 1);
 	return 0;
 }
@@ -1050,6 +1012,12 @@ do_setup_env(struct ssh *ssh, Session *s, const char *shell)
 
 	if (getenv("TZ"))
 		child_set_env(&env, &envsize, "TZ", getenv("TZ"));
+#ifdef HAVE_LOGIN_CAP
+	if (getenv("XDG_RUNTIME_DIR")) {
+		child_set_env(&env, &envsize, "XDG_RUNTIME_DIR",
+		    getenv("XDG_RUNTIME_DIR"));
+	}
+#endif /* HAVE_LOGIN_CAP */
 	if (s->term)
 		child_set_env(&env, &envsize, "TERM", s->term);
 	if (s->display)
@@ -2171,7 +2139,8 @@ session_auth_agent_req(struct ssh *ssh, Session *s)
 	if ((r = sshpkt_get_end(ssh)) != 0)
 		sshpkt_fatal(ssh, r, "%s: parse packet", __func__);
 	if (!auth_opts->permit_agent_forwarding_flag ||
-	    !options.allow_agent_forwarding) {
+	    !options.allow_agent_forwarding ||
+	    options.disable_forwarding) {
 		debug_f("agent forwarding disabled");
 		return 0;
 	}
@@ -2566,7 +2535,7 @@ session_setup_x11fwd(struct ssh *ssh, Session *s)
 		ssh_packet_send_debug(ssh, "X11 forwarding disabled by key options.");
 		return 0;
 	}
-	if (!options.x11_forwarding) {
+	if (!options.x11_forwarding || options.disable_forwarding) {
 		debug("X11 forwarding disabled in server configuration file.");
 		return 0;
 	}

@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-sk-client.c,v 1.12 2022/01/14 03:34:00 djm Exp $ */
+/* $OpenBSD: ssh-sk-client.c,v 1.14 2026/02/14 00:18:34 jsg Exp $ */
 /*
  * Copyright (c) 2019 Google LLC
  *
@@ -21,7 +21,6 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 
-#include <fcntl.h>
 #include <limits.h>
 #include <errno.h>
 #include <signal.h>
@@ -36,7 +35,6 @@
 #include "sshbuf.h"
 #include "sshkey.h"
 #include "msg.h"
-#include "digest.h"
 #include "pathnames.h"
 #include "ssh-sk.h"
 #include "misc.h"
@@ -439,6 +437,7 @@ sshsk_load_resident(const char *provider_path, const char *device,
 		}
 		if ((srk = calloc(1, sizeof(*srk))) == NULL) {
 			error_f("calloc failed");
+			r = SSH_ERR_ALLOC_FAIL;
 			goto out;
 		}
 		srk->key = key;
@@ -450,6 +449,7 @@ sshsk_load_resident(const char *provider_path, const char *device,
 		if ((tmp = recallocarray(srks, nsrks, nsrks + 1,
 		    sizeof(*srks))) == NULL) {
 			error_f("recallocarray keys failed");
+			r = SSH_ERR_ALLOC_FAIL;
 			goto out;
 		}
 		debug_f("srks[%zu]: %s %s uidlen %zu", nsrks,

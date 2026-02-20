@@ -1,4 +1,4 @@
-/* $OpenBSD: sshd-session.c,v 1.9 2024/09/09 02:39:57 djm Exp $ */
+/* $OpenBSD: sshd-session.c,v 1.20 2026/02/09 21:38:14 dtucker Exp $ */
 /*
  * SSH2 implementation:
  * Privilege Separation:
@@ -31,23 +31,17 @@
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
-#include <sys/socket.h>
-#ifdef HAVE_SYS_STAT_H
-# include <sys/stat.h>
-#endif
-#ifdef HAVE_SYS_TIME_H
-# include <sys/time.h>
-#endif
-#include "openbsd-compat/sys-tree.h"
-#include "openbsd-compat/sys-queue.h"
 #include <sys/wait.h>
+#include <sys/tree.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/queue.h>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
-#ifdef HAVE_PATHS_H
-# include <paths.h>
-#endif
+#include <paths.h>
 #include <pwd.h>
 #include <grp.h>
 #include <signal.h>
@@ -57,13 +51,6 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <limits.h>
-
-#ifdef WITH_OPENSSL
-#include <openssl/bn.h>
-#include <openssl/evp.h>
-#include <openssl/rand.h>
-#include "openbsd-compat/openssl-compat.h"
-#endif
 
 #ifdef HAVE_SECUREWARE
 #include <sys/security.h>
@@ -111,9 +98,8 @@
 
 /* Re-exec fds */
 #define REEXEC_DEVCRYPTO_RESERVED_FD	(STDERR_FILENO + 1)
-#define REEXEC_STARTUP_PIPE_FD		(STDERR_FILENO + 2)
-#define REEXEC_CONFIG_PASS_FD		(STDERR_FILENO + 3)
-#define REEXEC_MIN_FREE_FD		(STDERR_FILENO + 4)
+#define REEXEC_CONFIG_PASS_FD		(STDERR_FILENO + 2)
+#define REEXEC_MIN_FREE_FD		(STDERR_FILENO + 3)
 
 /* Privsep fds */
 #define PRIVSEP_MONITOR_FD		(STDERR_FILENO + 1)
@@ -276,27 +262,6 @@ demote_sensitive_data(void)
 	}
 }
 
-static void
-reseed_prngs(void)
-{
-	u_int32_t rnd[256];
-
-#ifdef WITH_OPENSSL
-	RAND_poll();
-#endif
-	arc4random_stir(); /* noop on recent arc4random() implementations */
-	arc4random_buf(rnd, sizeof(rnd)); /* let arc4random notice PID change */
-
-#ifdef WITH_OPENSSL
-	RAND_seed(rnd, sizeof(rnd));
-	/* give libcrypto a chance to notice the PID change */
-	if ((RAND_bytes((u_char *)rnd, 1)) != 1)
-		fatal("%s: RAND_bytes failed", __func__);
-#endif
-
-	explicit_bzero(rnd, sizeof(rnd));
-}
-
 struct sshbuf *
 pack_hostkeys(void)
 {
@@ -337,7 +302,7 @@ pack_hostkeys(void)
 static int
 privsep_preauth(struct ssh *ssh)
 {
-	int status, r;
+	int r;
 	pid_t pid;
 
 	/* Set up unprivileged child process to deal with network data */
@@ -359,23 +324,7 @@ privsep_preauth(struct ssh *ssh)
 			}
 		}
 		monitor_child_preauth(ssh, pmonitor);
-
-		/* Wait for the child's exit status */
-		while (waitpid(pid, &status, 0) == -1) {
-			if (errno == EINTR)
-				continue;
-			pmonitor->m_pid = -1;
-			fatal_f("waitpid: %s", strerror(errno));
-		}
 		privsep_is_preauth = 0;
-		pmonitor->m_pid = -1;
-		if (WIFEXITED(status)) {
-			if (WEXITSTATUS(status) != 0)
-				fatal_f("preauth child exited with status %d",
-				    WEXITSTATUS(status));
-		} else if (WIFSIGNALED(status))
-			fatal_f("preauth child terminated by signal %d",
-			    WTERMSIG(status));
 		return 1;
 	} else {
 		/* child */
@@ -428,7 +377,7 @@ privsep_postauth(struct ssh *ssh, Authctxt *authctxt)
 	 * Hack for systems that don't support FD passing: retain privileges
 	 * in the post-auth privsep process so it can allocate PTYs directly.
 	 * This is basically equivalent to what we did <= 9.7, which was to
-	 * disable post-auth privsep entriely.
+	 * disable post-auth privsep entirely.
 	 * Cygwin doesn't need to drop privs here although it doesn't support
 	 * fd passing, as AFAIK PTY allocation on this platform doesn't require
 	 * special privileges to begin with.
@@ -486,12 +435,10 @@ get_hostkey_by_type(int type, int nid, int need_private, struct ssh *ssh)
 	for (i = 0; i < options.num_host_key_files; i++) {
 		switch (type) {
 		case KEY_RSA_CERT:
-		case KEY_DSA_CERT:
 		case KEY_ECDSA_CERT:
 		case KEY_ED25519_CERT:
 		case KEY_ECDSA_SK_CERT:
 		case KEY_ED25519_SK_CERT:
-		case KEY_XMSS_CERT:
 			key = sensitive_data.host_certificates[i];
 			break;
 		default:
@@ -704,6 +651,8 @@ recv_rexec_state(int fd, struct sshbuf *conf, uint64_t *timing_secretp)
 
 	if ((m = sshbuf_new()) == NULL || (inc = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
+
+	/* receive config */
 	if (ssh_msg_recv(fd, m) == -1)
 		fatal_f("ssh_msg_recv failed");
 	if ((r = sshbuf_get_u8(m, &ver)) != 0)
@@ -712,7 +661,6 @@ recv_rexec_state(int fd, struct sshbuf *conf, uint64_t *timing_secretp)
 		fatal_f("rexec version mismatch");
 	if ((r = sshbuf_get_string(m, &cp, &len)) != 0 || /* XXX _direct */
 	    (r = sshbuf_get_u64(m, timing_secretp)) != 0 ||
-	    (r = sshbuf_froms(m, &hostkeys)) != 0 ||
 	    (r = sshbuf_get_stringb(m, inc)) != 0)
 		fatal_fr(r, "parse config");
 
@@ -730,6 +678,13 @@ recv_rexec_state(int fd, struct sshbuf *conf, uint64_t *timing_secretp)
 		TAILQ_INSERT_TAIL(&includes, item, entry);
 	}
 
+	/* receive hostkeys */
+	sshbuf_reset(m);
+	if (ssh_msg_recv(fd, m) == -1)
+		fatal_f("ssh_msg_recv failed");
+	if ((r = sshbuf_get_u8(m, NULL)) != 0 ||
+	    (r = sshbuf_froms(m, &hostkeys)) != 0)
+		fatal_fr(r, "parse config");
 	parse_hostkeys(hostkeys);
 
 	free(cp);
@@ -987,12 +942,12 @@ main(int ac, char **av)
 		exit(1);
 	}
 
-	debug("sshd version %s, %s", SSH_VERSION, SSH_OPENSSL_VERSION);
-
 	if (!rexeced_flag)
 		fatal("sshd-session should not be executed directly");
 
 	closefrom(REEXEC_MIN_FREE_FD);
+
+	platform_pre_session_start();
 
 	/* Reserve fds we'll need later for reexec things */
 	if ((devnull = open(_PATH_DEVNULL, O_RDWR)) == -1)
@@ -1028,20 +983,21 @@ main(int ac, char **av)
 	    SYSLOG_FACILITY_AUTH : options.log_facility,
 	    log_stderr || !inetd_flag || debug_flag);
 
-	debug("sshd version %s, %s", SSH_VERSION, SSH_OPENSSL_VERSION);
-
 	/* Fetch our configuration */
 	if ((cfg = sshbuf_new()) == NULL)
 		fatal("sshbuf_new config buf failed");
 	setproctitle("%s", "[rexeced]");
 	recv_rexec_state(REEXEC_CONFIG_PASS_FD, cfg, &timing_secret);
-	/* close the fd, but keep the slot reserved */
-	if (dup2(devnull, REEXEC_CONFIG_PASS_FD) == -1)
-		fatal("dup2 devnull->config fd: %s", strerror(errno));
 	parse_server_config(&options, "rexec", cfg, &includes, NULL, 1);
 	/* Fill in default values for those options not explicitly set. */
 	fill_default_server_options(&options);
 	options.timing_secret = timing_secret;
+
+	/* Reinit logging in case config set Level, Facility or Verbose. */
+	log_init(__progname, options.log_level, options.log_facility,
+	    log_stderr || !inetd_flag || debug_flag);
+
+	debug("sshd-session version %s, %s", SSH_VERSION, SSH_OPENSSL_VERSION);
 
 	/* Store privilege separation user for later use if required. */
 	privsep_chroot = (getuid() == 0 || geteuid() == 0);
@@ -1057,11 +1013,8 @@ main(int ac, char **av)
 	endpwent();
 
 	if (!debug_flag && !inetd_flag) {
-		if ((startup_pipe = dup(REEXEC_STARTUP_PIPE_FD)) == -1)
+		if ((startup_pipe = dup(REEXEC_CONFIG_PASS_FD)) == -1)
 			fatal("internal error: no startup pipe");
-		/* close the fd, but keep the slot reserved */
-		if (dup2(devnull, REEXEC_STARTUP_PIPE_FD) == -1)
-			fatal("dup2 devnull->startup fd: %s", strerror(errno));
 
 		/*
 		 * Signal parent that this child is at a point where
@@ -1069,6 +1022,9 @@ main(int ac, char **av)
 		 */
 		(void)atomicio(vwrite, startup_pipe, "\0", 1);
 	}
+	/* close the fd, but keep the slot reserved */
+	if (dup2(devnull, REEXEC_CONFIG_PASS_FD) == -1)
+		fatal("dup2 devnull->config fd: %s", strerror(errno));
 
 	/* Check that options are sensible */
 	if (options.authorized_keys_command_user == NULL &&
@@ -1200,6 +1156,8 @@ main(int ac, char **av)
 		fatal("Unable to create connection");
 	the_active_state = ssh;
 	ssh_packet_set_server(ssh);
+	ssh_packet_set_qos(ssh, options.ip_qos_interactive,
+	    options.ip_qos_bulk);
 
 	check_ip_options(ssh);
 
@@ -1265,6 +1223,9 @@ main(int ac, char **av)
 	if ((r = kex_exchange_identification(ssh, -1,
 	    options.version_addendum)) != 0)
 		sshpkt_fatal(ssh, r, "banner exchange");
+
+	if ((ssh->compat & SSH_BUG_NOREKEY))
+		debug("client does not support rekeying");
 
 	ssh_packet_set_nonblocking(ssh);
 
@@ -1389,8 +1350,6 @@ sshd_hostkey_sign(struct ssh *ssh, struct sshkey *privkey,
 void
 cleanup_exit(int i)
 {
-	extern int auth_attempted; /* monitor.c */
-
 	if (the_active_state != NULL && the_authctxt != NULL) {
 		do_cleanup(the_active_state, the_authctxt);
 		if (privsep_is_preauth &&
@@ -1409,7 +1368,9 @@ cleanup_exit(int i)
 		audit_event(the_active_state, SSH_CONNECTION_ABANDON);
 #endif
 	/* Override default fatal exit value when auth was attempted */
-	if (i == 255 && auth_attempted)
+	if (i == 255 && monitor_auth_attempted())
 		_exit(EXIT_AUTH_ATTEMPTED);
+	if (i == 255 && monitor_invalid_user())
+		_exit(EXIT_INVALID_USER);
 	_exit(i);
 }

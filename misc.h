@@ -1,4 +1,4 @@
-/* $OpenBSD: misc.h,v 1.110 2024/09/25 01:24:04 djm Exp $ */
+/* $OpenBSD: misc.h,v 1.114 2025/12/05 07:43:12 djm Exp $ */
 
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
@@ -59,6 +59,8 @@ void	skip_space(char **);
 const char *strprefix(const char *, const char *, int);
 char	*strdelim(char **);
 char	*strdelimw(char **);
+void	 stringlist_append(char ***listp, const char *s);
+void	 stringlist_free(char **list);
 int	 set_nonblock(int);
 int	 unset_nonblock(int);
 void	 set_nodelay(int);
@@ -79,7 +81,9 @@ char	*colon(char *);
 int	 parse_user_host_path(const char *, char **, char **, char **);
 int	 parse_user_host_port(const char *, char **, char **, int *);
 int	 parse_uri(const char *, const char *, char **, char **, int *, char **);
+double	 convtime_double(const char *);
 int	 convtime(const char *);
+double	 convtime_double(const char *);
 const char *fmt_timeframe(time_t t);
 int	 tilde_expand(const char *, uid_t, char **);
 char	*tilde_expand_filename(const char *, uid_t);
@@ -108,10 +112,13 @@ int	 parse_pattern_interval(const char *, char **, int *);
 int	 path_absolute(const char *);
 int	 stdfd_devnull(int, int, int);
 int	 lib_contains_symbol(const char *, const char *);
+char	*get_homedir(void);
 
 void	 sock_set_v6only(int);
 
 struct passwd *pwcopy(struct passwd *);
+void	 pwfree(struct passwd *); /* NB. only use with pwcopy */
+
 const char *ssh_gai_strerror(int);
 
 typedef void privdrop_fn(struct passwd *);
@@ -230,6 +237,11 @@ void ptimeout_deadline_monotime(struct timespec *pt, time_t when);
 int ptimeout_get_ms(struct timespec *pt);
 struct timespec *ptimeout_get_tsp(struct timespec *pt);
 int ptimeout_isset(struct timespec *pt);
+
+/* misc-agent.c */
+char	*agent_hostname_hash(void);
+int	 agent_listener(const char *, const char *, int *, char **);
+void	 agent_cleanup_stale(const char *, int);
 
 /* readpass.c */
 

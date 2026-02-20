@@ -1,4 +1,4 @@
-/* $OpenBSD: krl.c,v 1.59 2023/07/17 05:22:30 djm Exp $ */
+/* $OpenBSD: krl.c,v 1.63 2026/02/14 00:18:34 jsg Exp $ */
 /*
  * Copyright (c) 2012 Damien Miller <djm@mindrot.org>
  *
@@ -18,21 +18,18 @@
 #include "includes.h"
 
 #include <sys/types.h>
-#include <openbsd-compat/sys-tree.h>
-#include <openbsd-compat/sys-queue.h>
+#include <sys/tree.h>
+#include <sys/queue.h>
 
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "sshbuf.h"
 #include "ssherr.h"
 #include "sshkey.h"
-#include "authfile.h"
 #include "misc.h"
 #include "log.h"
 #include "digest.h"
@@ -149,6 +146,8 @@ revoked_certs_free(struct revoked_certs *rc)
 	struct revoked_serial *rs, *trs;
 	struct revoked_key_id *rki, *trki;
 
+	if (rc == NULL)
+		return;
 	RB_FOREACH_SAFE(rs, revoked_serial_tree, &rc->revoked_serials, trs) {
 		RB_REMOVE(revoked_serial_tree, &rc->revoked_serials, rs);
 		free(rs);
@@ -159,6 +158,7 @@ revoked_certs_free(struct revoked_certs *rc)
 		free(rki);
 	}
 	sshkey_free(rc->ca_key);
+	freezero(rc, sizeof(*rc));
 }
 
 void
@@ -674,6 +674,7 @@ revoked_certs_generate(struct revoked_certs *rc, struct sshbuf *buf)
 			break;
 		case KRL_SECTION_CERT_SERIAL_BITMAP:
 			if (rs->lo - bitmap_start > INT_MAX) {
+				r = SSH_ERR_INVALID_FORMAT;
 				error_f("insane bitmap gap");
 				goto out;
 			}
@@ -1059,6 +1060,7 @@ ssh_krl_from_blob(struct sshbuf *buf, struct ssh_krl **krlp)
 	}
 
 	if ((krl = ssh_krl_init()) == NULL) {
+		r = SSH_ERR_ALLOC_FAIL;
 		error_f("alloc failed");
 		goto out;
 	}

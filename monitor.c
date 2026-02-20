@@ -1,4 +1,4 @@
-/* $OpenBSD: monitor.c,v 1.247 2024/12/03 22:30:03 jsg Exp $ */
+/* $OpenBSD: monitor.c,v 1.252 2026/02/08 19:54:31 dtucker Exp $ */
 /*
  * Copyright 2002 Niels Provos <provos@citi.umich.edu>
  * Copyright 2002 Markus Friedl <markus@openbsd.org>
@@ -28,39 +28,29 @@
 #include "includes.h"
 
 #include <sys/types.h>
-#include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/tree.h>
+#include <sys/queue.h>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#ifdef HAVE_PATHS_H
 #include <paths.h>
-#endif
+#include <poll.h>
 #include <pwd.h>
 #include <signal.h>
-#ifdef HAVE_STDINT_H
-# include <stdint.h>
-#endif
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <unistd.h>
-#ifdef HAVE_POLL_H
-#include <poll.h>
-#else
-# ifdef HAVE_SYS_POLL_H
-#  include <sys/poll.h>
-# endif
-#endif
 
 #ifdef WITH_OPENSSL
 #include <openssl/dh.h>
 #endif
 
-#include "openbsd-compat/sys-tree.h"
-#include "openbsd-compat/sys-queue.h"
 #include "openbsd-compat/openssl-compat.h"
 
 #include "atomicio.h"
@@ -165,7 +155,8 @@ static char *auth_submethod = NULL;
 static u_int session_id2_len = 0;
 static u_char *session_id2 = NULL;
 static pid_t monitor_child_pid;
-int auth_attempted = 0;
+static int auth_attempted = 0;
+static int invalid_user = 0;
 
 struct mon_table {
 	enum monitor_reqtype type;
@@ -272,7 +263,7 @@ void
 monitor_child_preauth(struct ssh *ssh, struct monitor *pmonitor)
 {
 	struct mon_table *ent;
-	int authenticated = 0, partial = 0;
+	int status, authenticated = 0, partial = 0;
 
 	debug3("preauth child monitor started");
 
@@ -375,11 +366,29 @@ monitor_child_preauth(struct ssh *ssh, struct monitor *pmonitor)
 	while (pmonitor->m_log_recvfd != -1 && monitor_read_log(pmonitor) == 0)
 		;
 
+	/* Wait for the child's exit status */
+	while (waitpid(pmonitor->m_pid, &status, 0) == -1) {
+		if (errno == EINTR)
+			continue;
+		fatal_f("waitpid: %s", strerror(errno));
+	}
+	if (WIFEXITED(status)) {
+		if (WEXITSTATUS(status) != 0)
+			fatal_f("preauth child %ld exited with status %d",
+			    (long)pmonitor->m_pid, WEXITSTATUS(status));
+	} else if (WIFSIGNALED(status)) {
+		fatal_f("preauth child %ld terminated by signal %d",
+		    (long)pmonitor->m_pid, WTERMSIG(status));
+	}
+	debug3_f("preauth child %ld terminated successfully",
+	    (long)pmonitor->m_pid);
+
 	if (pmonitor->m_recvfd >= 0)
 		close(pmonitor->m_recvfd);
 	if (pmonitor->m_log_sendfd >= 0)
 		close(pmonitor->m_log_sendfd);
 	pmonitor->m_sendfd = pmonitor->m_log_recvfd = -1;
+	pmonitor->m_pid = -1;
 }
 
 static void
@@ -577,15 +586,13 @@ monitor_reset_key_state(void)
 }
 
 int
-mm_answer_state(struct ssh *ssh, int sock, struct sshbuf *m)
+mm_answer_state(struct ssh *ssh, int sock, struct sshbuf *unused)
 {
-	struct sshbuf *inc = NULL, *hostkeys = NULL;
+	struct sshbuf *m = NULL, *inc = NULL, *hostkeys = NULL;
 	struct sshbuf *opts = NULL, *confdata = NULL;
 	struct include_item *item = NULL;
 	int postauth;
 	int r;
-
-	sshbuf_reset(m);
 
 	debug_f("config len %zu", sshbuf_len(cfg));
 
@@ -644,9 +651,10 @@ mm_answer_state(struct ssh *ssh, int sock, struct sshbuf *m)
 	sshbuf_free(inc);
 	sshbuf_free(opts);
 	sshbuf_free(confdata);
+	sshbuf_free(hostkeys);
 
 	mm_request_send(sock, MONITOR_ANS_STATE, m);
-
+	sshbuf_free(m);
 	debug3_f("done");
 
 	return (0);
@@ -814,7 +822,7 @@ mm_encode_server_options(struct sshbuf *m)
 		    (r = sshbuf_put_cstring(m, options.x)) != 0) \
 			fatal_fr(r, "assemble %s", #x); \
 	} while (0)
-#define M_CP_STRARRAYOPT(x, nx) do { \
+#define M_CP_STRARRAYOPT(x, nx, clobber) do { \
 		for (i = 0; i < options.nx; i++) { \
 			if ((r = sshbuf_put_cstring(m, options.x[i])) != 0) \
 				fatal_fr(r, "assemble %s", #x); \
@@ -848,6 +856,7 @@ mm_answer_pwnamallow(struct ssh *ssh, int sock, struct sshbuf *m)
 	sshbuf_reset(m);
 
 	if (pwent == NULL) {
+		invalid_user = 1;
 		if ((r = sshbuf_put_u8(m, 0)) != 0)
 			fatal_fr(r, "assemble fakepw");
 		authctxt->pw = fakepw();
@@ -1011,7 +1020,6 @@ mm_answer_authpassword(struct ssh *ssh, int sock, struct sshbuf *m)
 		fatal_fr(r, "assemble PAM");
 #endif
 
-	debug3("%s: sending result %d", __func__, authenticated);
 	debug3_f("sending result %d", authenticated);
 	mm_request_send(sock, MONITOR_ANS_AUTHPASSWORD, m);
 
@@ -1098,7 +1106,7 @@ int
 mm_answer_pam_start(struct ssh *ssh, int sock, struct sshbuf *m)
 {
 	if (!options.use_pam)
-		fatal("UsePAM not set, but ended up in %s anyway", __func__);
+		fatal_f("UsePAM not set, but ended up in %s anyway", __func__);
 
 	start_pam(ssh);
 
@@ -1116,13 +1124,14 @@ mm_answer_pam_account(struct ssh *ssh, int sock, struct sshbuf *m)
 	int r;
 
 	if (!options.use_pam)
-		fatal("%s: PAM not enabled", __func__);
+		fatal_f("PAM not enabled");
 
 	ret = do_pam_account();
 
 	if ((r = sshbuf_put_u32(m, ret)) != 0 ||
 	    (r = sshbuf_put_stringb(m, loginmsg)) != 0)
-		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		fatal_fr(r, "buffer error");
+	sshbuf_reset(loginmsg);
 
 	mm_request_send(sock, MONITOR_ANS_PAM_ACCOUNT, m);
 
@@ -1138,11 +1147,11 @@ mm_answer_pam_init_ctx(struct ssh *ssh, int sock, struct sshbuf *m)
 	u_int ok = 0;
 	int r;
 
-	debug3("%s", __func__);
+	debug3_f("entering");
 	if (!options.kbd_interactive_authentication)
-		fatal("%s: kbd-int authentication not enabled", __func__);
+		fatal_f("kbd-int authentication not enabled");
 	if (sshpam_ctxt != NULL)
-		fatal("%s: already called", __func__);
+		fatal_f("already called");
 	sshpam_ctxt = (sshpam_device.init_ctx)(authctxt);
 	sshpam_authok = NULL;
 	sshbuf_reset(m);
@@ -1152,7 +1161,7 @@ mm_answer_pam_init_ctx(struct ssh *ssh, int sock, struct sshbuf *m)
 		ok = 1;
 	}
 	if ((r = sshbuf_put_u32(m, ok)) != 0)
-		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		fatal_fr(r, "buffer error");
 	mm_request_send(sock, MONITOR_ANS_PAM_INIT_CTX, m);
 	return (0);
 }
@@ -1164,10 +1173,10 @@ mm_answer_pam_query(struct ssh *ssh, int sock, struct sshbuf *m)
 	u_int i, num = 0, *echo_on = 0;
 	int r, ret;
 
-	debug3("%s", __func__);
+	debug3_f("entering");
 	sshpam_authok = NULL;
 	if (sshpam_ctxt == NULL)
-		fatal("%s: no context", __func__);
+		fatal_f("no context");
 	ret = (sshpam_device.query)(sshpam_ctxt, &name, &info,
 	    &num, &prompts, &echo_on);
 	if (ret == 0 && num == 0)
@@ -1181,13 +1190,13 @@ mm_answer_pam_query(struct ssh *ssh, int sock, struct sshbuf *m)
 	    (r = sshbuf_put_cstring(m, info)) != 0 ||
 	    (r = sshbuf_put_u32(m, sshpam_get_maxtries_reached())) != 0 ||
 	    (r = sshbuf_put_u32(m, num)) != 0)
-		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		fatal_fr(r, "buffer error");
 	free(name);
 	free(info);
 	for (i = 0; i < num; ++i) {
 		if ((r = sshbuf_put_cstring(m, prompts[i])) != 0 ||
 		    (r = sshbuf_put_u32(m, echo_on[i])) != 0)
-			fatal("%s: buffer error: %s", __func__, ssh_err(r));
+			fatal_fr(r, "buffer error");
 		free(prompts[i]);
 	}
 	free(prompts);
@@ -1205,12 +1214,12 @@ mm_answer_pam_respond(struct ssh *ssh, int sock, struct sshbuf *m)
 	u_int i, num;
 	int r, ret;
 
-	debug3("%s", __func__);
+	debug3_f("entering");
 	if (sshpam_ctxt == NULL)
-		fatal("%s: no context", __func__);
+		fatal_f("no context");
 	sshpam_authok = NULL;
 	if ((r = sshbuf_get_u32(m, &num)) != 0)
-		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		fatal_fr(r, "buffer error");
 	if (num > PAM_MAX_NUM_MSG) {
 		fatal_f("Too many PAM messages, got %u, expected <= %u",
 		    num, (unsigned)PAM_MAX_NUM_MSG);
@@ -1231,7 +1240,7 @@ mm_answer_pam_respond(struct ssh *ssh, int sock, struct sshbuf *m)
 	}
 	sshbuf_reset(m);
 	if ((r = sshbuf_put_u32(m, ret)) != 0)
-		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		fatal_fr(r, "buffer error");
 	mm_request_send(sock, MONITOR_ANS_PAM_RESPOND, m);
 	auth_method = "keyboard-interactive";
 	auth_submethod = "pam";
@@ -1245,9 +1254,9 @@ mm_answer_pam_free_ctx(struct ssh *ssh, int sock, struct sshbuf *m)
 {
 	int r = sshpam_authok != NULL && sshpam_authok == sshpam_ctxt;
 
-	debug3("%s", __func__);
+	debug3_f("entering");
 	if (sshpam_ctxt == NULL)
-		fatal("%s: no context", __func__);
+		fatal_f("no context");
 	(sshpam_device.free_ctx)(sshpam_ctxt);
 	sshpam_ctxt = sshpam_authok = NULL;
 	sshbuf_reset(m);
@@ -1778,10 +1787,10 @@ mm_answer_audit_event(struct ssh *ssh, int socket, struct sshbuf *m)
 	ssh_audit_event_t event;
 	int r;
 
-	debug3("%s entering", __func__);
+	debug3_f("entering");
 
 	if ((r = sshbuf_get_u32(m, &n)) != 0)
-		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		fatal_fr(r, "buffer error");
 	event = (ssh_audit_event_t)n;
 	switch (event) {
 	case SSH_AUTH_FAIL_PUBKEY:
@@ -1806,9 +1815,9 @@ mm_answer_audit_command(struct ssh *ssh, int socket, struct sshbuf *m)
 	char *cmd;
 	int r;
 
-	debug3("%s entering", __func__);
+	debug3_f("entering");
 	if ((r = sshbuf_get_cstring(m, &cmd, NULL)) != 0)
-		fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		fatal_fr(r, "buffer error");
 	/* sanity check command, if so how? */
 	audit_run_command(cmd);
 	free(cmd);
@@ -1936,6 +1945,18 @@ void
 monitor_reinit(struct monitor *mon)
 {
 	monitor_openfds(mon, 0);
+}
+
+int
+monitor_auth_attempted(void)
+{
+	return auth_attempted;
+}
+
+int
+monitor_invalid_user(void)
+{
+	return invalid_user;
 }
 
 #ifdef GSSAPI
