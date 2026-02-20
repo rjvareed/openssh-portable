@@ -12,7 +12,7 @@
 void log_encrypt(char *msg, FILE *out_fd, EVP_PKEY *key, EVP_PKEY_CTX *ctx){
 	//encrypt data
 	char encrypted[512];
-	size_t outlen;
+	size_t outlen = sizeof(encrypted);
 	EVP_PKEY_encrypt(ctx,encrypted,&outlen,msg,strlen(msg));
 	
 	//write to file
